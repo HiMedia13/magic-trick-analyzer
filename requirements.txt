@@ -10,3 +10,5 @@ yt-dlp>=2024.1        # YouTube URL 입력 다운로드에만 필요
 flask>=3.0            # 웹 UI(webapp/app.py)에만 필요
 ultralytics>=8.0      # 객체 검출(카드 YOLOv8) — 없으면 OBJECT_CHANGE 신호 비활성
 huggingface_hub>=0.20 # 카드 detector 모델 다운로드(첫 1회)
+faster-whisper>=1.0   # scripts/auto_label.py: 해설 음성을 자막화해 자동 라벨링
+imageio-ffmpeg>=0.5   # auto_label용 ffmpeg 바이너리 번들(시스템 ffmpeg 없어도 작동)

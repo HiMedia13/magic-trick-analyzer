@@ -171,6 +171,25 @@ python scripts/build_library.py --technique "프렌치 드롭" --video coin.mp4 
 매칭은 모드(카드/동전)로 후보를 걸러, 카드 영상이 동전 기법에 매칭되는 교차 오류를 막습니다.
 한계: 튜토리얼 시연 ≠ 실제 공연, 작은 라이브러리는 커버리지 제한 — 검증된 예시를 늘릴수록 좋아집니다.
 
+#### 자동 라벨링 (해설 음성 STT 기반)
+'마술 비밀 공개' 류 채널은 해설자가 음성으로 기법 이름을 말합니다. 그 음성 자체가
+라벨이므로 사람 라벨링 없이 자동 누적이 가능합니다.
+
+```powershell
+# YouTube URL(들) → 자동 다운로드 → Whisper 전사 → 기법 언급 검출 → 시그니처 등록
+python scripts/auto_label.py "https://youtu.be/URL1" "https://youtu.be/URL2"
+
+# 후보만 보고 등록은 건너뛰기(검토용)
+python scripts/auto_label.py "https://youtu.be/URL" --dry-run
+
+# 해설자가 시연 직후에 말하는 경향이면 음수 offset으로 시점 보정
+python scripts/auto_label.py "https://youtu.be/URL" --offset -2.0
+```
+
+faster-whisper로 영어 자막을 추출하고 `techniques.lookup()`의 별칭 매칭으로 기법명을
+찾아 부정문/도입부 문장을 자동 제외합니다. 등록된 라벨은 `source=stt:<id>@<sec>|<문장>`로
+출처가 기록됩니다.
+
 ### LangSmith 추적 (선택)
 에이전트 실행과 **도구 호출이 LangSmith 트레이스에 그대로 기록**됩니다(키가 있을 때).
 이미지는 inspect 도구의 비전 서브호출에만 들어가 메인 트레이스가 가볍습니다. 키는 `.env`로 줍니다
