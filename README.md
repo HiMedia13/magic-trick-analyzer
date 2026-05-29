@@ -1,6 +1,6 @@
-# magic-analyzer 🃏🪙
+# magic-trick-analyzer 🃏🪙
 
-카드/동전 마술 **영상**을 넣으면, 손을 추적해 **"수상한 순간"**을 타임라인으로 짚어주는 분석 도구.
+카드/동전 마술 **영상**을 넣으면, **손 + 카드/동전 객체**를 함께 추적해 **"수상한 순간"**을 타임라인으로 짚어주고, OpenAI 비전 에이전트가 기법을 추론·설명하는 분석 도구.
 
 > ⚠️ **솔직한 한계**
 > 마술은 사람의 지각을 속이도록 설계돼 있어, 영상 한 개로 비밀을 **확정**하는 것은 불가능합니다.
@@ -8,23 +8,33 @@
 > 찾아 사람이 다시 돌려보도록 돕는 **보조 도구**입니다.
 
 ## 주요 기능
-- 🖐️ **의심 순간 탐지** — MediaPipe 손 추적으로 팜·전달·급동작·주먹쥠을 점수화 → 비최대억제(NMS)로 또렷한 순간만
+- 🖐️ **손 신호 탐지** — MediaPipe 손 추적으로 팜·전달·급동작·주먹쥠을 점수화 → 비최대억제(NMS)로 또렷한 순간만
+- 🎯 **객체 신호 탐지** — YOLO 카드 검출기 + HoughCircles 동전 검출로 객체 등장/소실 전이를 잡음 (`OBJECT_CHANGE` 신호)
 - 🃏🪙 **카드/동전 자동 판별** — `--mode auto`: 영상 프레임을 보고 종류를 분류해 해당 모드로 분석
 - 🤖 **도구 호출 에이전트** — LangGraph ReAct + OpenAI `gpt-4o`. 의심 순간을 직접 들여다보고(비전) 기법을 추론
 - 🎓 **기법 용어집(33종) + 참고 영상** — 작동 원리·관찰 단서·튜토리얼 링크 제공
-- 🔍 **예시 라이브러리 매칭(few-shot)** — 손 궤적 시그니처(28종)로 기법 유사도 비교
-- 🌐 **웹 UI(Flask)** — URL/업로드 → 마킹 영상·타임라인·기법 설명·매칭을 한 화면에
+- 🔍 **예시 라이브러리 매칭(few-shot)** — 손 궤적 시그니처로 기법 유사도 비교
+- 🏷️ **Active learning 라벨링** — 웹 UI에서 의심 시점·임의 시점에 사용자가 직접 기법을 붙여 라이브러리 누적
+- 🌐 **웹 UI(Flask)** — URL/업로드 → 마킹 영상·타임라인·기법 설명·매칭·라벨링을 한 화면에
 - 📊 **LangSmith 추적**(선택) · 🎬 **입력**: 로컬 파일 또는 YouTube URL(yt-dlp 자동 다운로드)
 
 ## 무엇을 탐지하나
 
-| 신호 | 의미(가능성) |
-|------|------|
-| `VANISH` | 보이던 손이 사라짐 — 팜으로 숨김 / 주머니로 디치 |
-| `BORDER` | 손이 화면 가장자리로 빠짐 — 랩/주머니/오프스크린 이동 |
-| `CONTACT` | 두 손이 맞닿음 — 몰래 전달 / 로드 |
-| `FAST` | 손이 순간적으로 빠르게 움직임 — 패스/슬레이트 |
-| `GRAB` | 펼친 손이 갑자기 주먹 — 코인/카드 팜 |
+손 키네마틱 신호 5종 + 객체 변화 신호 1종, **총 6종**을 가중합해 점수화합니다.
+
+| 신호 | 출처 | 의미(가능성) |
+|------|------|------|
+| `VANISH` | 손 | 보이던 손이 사라짐 — 팜으로 숨김 / 주머니로 디치 |
+| `BORDER` | 손 | 손이 화면 가장자리로 빠짐 — 랩/주머니/오프스크린 이동 |
+| `CONTACT` | 손 | 두 손이 맞닿음 — 몰래 전달 / 로드 |
+| `FAST` | 손 | 손이 순간적으로 빠르게 움직임 — 패스/슬레이트 |
+| `GRAB` | 손 | 펼친 손이 갑자기 주먹 — 코인/카드 팜 |
+| `OBJECT_CHANGE` | 객체 | 카드/동전 자체의 등장·소실·면적 급감 — 매끄러운 슬레이트 보완 |
+
+손 키네마틱은 매끄러운 슬레이트(잘 된 팜·부드러운 컨트롤)를 놓치기 때문에 객체 검출을
+독립 신호로 추가했습니다. 카드는 YOLOv8 52-class detector
+(`mustafakemal0146/playing-cards-yolov8`, HF에서 lazy 다운로드), 동전은 `cv2.HoughCircles`
+휴리스틱을 사용합니다.
 
 `--mode card` 와 `--mode coin` 은 위 신호의 가중치가 다릅니다. **`--mode auto`** 를 주면
 영상 프레임을 OpenAI 비전으로 분석해 카드/동전을 **자동 판별**한 뒤 그 모드로 분석합니다
@@ -92,10 +102,11 @@ python main.py trick.mp4 --mode card --score-thresh 0.4
 - `llm.txt` / `llm.json` — (옵션 `--llm`) 구간별 OpenAI 비전 추론 결과
 
 ## 동작 원리
-1. **손 추적** — MediaPipe Tasks(HandLandmarker, VIDEO 모드)로 프레임마다 손 21개 관절을
-   정규화 좌표로 추출
+1. **손 추적 + 객체 검출(병행)** — MediaPipe Tasks(HandLandmarker, VIDEO 모드)로 프레임마다
+   손 21개 관절을 정규화 좌표로 추출. 동시에 stride=3 간격으로 YOLO 카드 detector +
+   HoughCircles 동전 검출을 돌려 객체 bbox/원 리스트 수집
 2. **신호 계산** — 손 개수 변화(VANISH) / 가장자리 *진입 이벤트*(BORDER) / 두 손 거리(CONTACT)
-   / 이동속도(FAST) / 펼침정도 급감(GRAB)
+   / 이동속도(FAST) / 펼침정도 급감(GRAB) / 객체 count·면적 전이(OBJECT_CHANGE)
 3. **점수화·봉우리 검출** — 모드별 가중합 → 스무딩 → **점수 봉우리를 비최대 억제(NMS)**로
    집어 `봉우리 ±window` 창으로 보고. 클로즈업은 신호가 상시 켜지므로 '임계 초과 구간'을
    잡으면 수십 초 덩어리가 된다 — 봉우리만 집어 또렷한 순간을 준다.
@@ -110,7 +121,23 @@ python webapp/app.py
 ```
 
 분석은 백그라운드로 돌아가고 화면이 진행상태를 폴링합니다. `AI 설명`을 켜려면
-`OPENAI_API_KEY`(.env)가 필요합니다.
+`OPENAI_API_KEY`(.env)가 필요합니다. 작업 상태는 `webapp/jobs/<id>/job.json`에
+영속화되어 서버 재시작 후에도 결과 페이지가 복원됩니다.
+
+### Active learning 라벨링 (웹 UI)
+결과 페이지에서 사용자가 직접 기법 라벨을 붙여 라이브러리를 누적할 수 있습니다.
+도구의 데이터 vs 사람의 판단 간 ground truth gap을 메우는 핵심 통로입니다.
+
+- **의심 시점 라벨링** — 각 의심 구간 카드에 접기/펼치기 라벨러. 펼쳐서 기법
+  드롭다운(33종) 선택 또는 자유 입력 → "라벨 등록". 등록 성공 시 summary가
+  "✓ 라벨 등록됨: <기법명>"로 갱신되고 라이브러리에 즉시 추가
+- **임의 시점 라벨링** — 탐지가 놓친 시점을 위한 카드. 시각(`01:23.45` 또는
+  `83.45`) + 기법 직접 지정. "▶ 현재 영상 시점" 버튼으로 마킹 영상의 currentTime
+  자동 입력
+
+등록된 라벨은 `library/signatures.json`에 `source=webapp:<job_id>@<sec>`로
+출처와 함께 저장됩니다. 다음 분석부터 `match_technique` 도구가 새 시그니처와
+코사인 유사도를 비교해 매칭에 반영합니다.
 
 ## 에이전트 분석 (LangGraph ReAct + 도구 호출 + LangSmith, 옵션)
 `--llm`을 켜면 고정 파이프라인이 아니라 **도구를 스스로 호출하는 ReAct 에이전트**
@@ -176,16 +203,19 @@ python scripts/tune.py samples/coin.mp4 --mode coin --score-thresh 1.0 --hist
 - [x] 기법 용어집 + 예시 라이브러리 few-shot 매칭
 - [x] 카드/동전 자동 판별(`--mode auto`)
 - [x] 간단한 웹 UI (Flask, `webapp/app.py`)
-- [ ] 동전/카드 **객체 자체** 추적(손이 아닌 물건의 사라짐 직접 감지)
-- [ ] 매칭 정밀도 개선(DTW 등) · 검증된 예시로 라이브러리 확충
+- [x] **동전/카드 객체 자체 추적** — YOLO 카드 detector + HoughCircles로 `OBJECT_CHANGE` 신호 추가
+- [x] **웹 UI active learning 라벨링** — 의심·임의 시점에 사용자가 기법 라벨링 → 라이브러리 누적
+- [ ] 매칭 정밀도 개선(DTW 등) · 라벨 데이터가 쌓이면 임계값 자동 튜닝/분류기 학습
+- [ ] 카드 detector의 face-down 약점 보완(rectangular-back 검출) · 동전 검출 정확도 향상
 
 ## 프로젝트 구조
 ```
 magic_analyzer/   video·fetch(입력) · hands·assets(추적) · detect(탐지) · report(출력)
-                  agent·classify(에이전트/자동판별) · techniques·library(지식/매칭) · cli(파이프라인)
+                  agent·classify(에이전트/자동판별) · objects(YOLO 카드+Hough 동전)
+                  techniques·library(지식/매칭) · cli(파이프라인)
 scripts/          build_library.py(라이브러리 구축) · tune.py(파라미터 튜닝)
-webapp/           app.py(Flask) · templates/index.html(화면)
-library/          signatures.json(기법 시그니처 28종)
+webapp/           app.py(Flask · /label · /techniques · 작업 영속화) · templates/index.html
+library/          signatures.json(기법 시그니처 — auto 생성 + 사용자 라벨링 누적)
 ```
 
 ## 면책
