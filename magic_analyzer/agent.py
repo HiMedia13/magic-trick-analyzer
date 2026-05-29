@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import os
+from dataclasses import dataclass, field
 
 import cv2
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -28,6 +29,23 @@ from langsmith import traceable
 from .detect import SIGNAL_DESC
 
 MODE_KO = {"card": "카드 마술", "coin": "동전 마술"}
+
+# 에이전트(요약 생성)와 비전 서브호출의 응답 길이 한도.
+# 요약은 자세한 결론(여러 단락)이 필요해 1500, 비전 한 컷 설명은 2~3문장이라 350.
+AGENT_MAX_TOKENS = 1500
+VISION_MAX_TOKENS = 350
+
+
+@dataclass
+class AgentScratch:
+    """에이전트 도구들이 공유하는 스크래치 상태.
+
+    도구 호출이 누적 결과를 남기려면 어딘가에 모아야 하는데, 클로저로 흘려놓으면
+    공유 관계가 암묵적이 된다. 이 데이터클래스로 한곳에 모아 명시적으로 만든다.
+    """
+    inspections: list[dict] = field(default_factory=list)
+    techniques_found: list[dict] = field(default_factory=list)
+    matches: list[dict] = field(default_factory=list)
 
 AGENT_SYSTEM = (
     "당신은 클로즈업 마술(카드·동전)의 기법을 분석하는 전문가 에이전트입니다. "
@@ -71,20 +89,59 @@ def _maybe_enable_tracing() -> None:
         os.environ.setdefault("LANGSMITH_PROJECT", "magic-analyzer")
 
 
-def _make_frame_reader(video_path: str, fps: float):
-    """time_sec → 직전/정점/직후 프레임(BGR) 리스트를 주는 함수."""
-    def read(time_sec: float, off: float = 0.4):
-        cap = cv2.VideoCapture(str(video_path))
+def _prebuffer_segment_frames(video_path: str, fps: float,
+                              segments: list[dict], off: float = 0.4) -> dict:
+    """모든 세그먼트의 직전/정점/직후 프레임을 한 번에 디코드해 메모리에 캐싱.
+
+    에이전트 루프 안에서 VideoCapture를 만지면 LLM API 호출 사이 idle 동안 FFmpeg
+    다중스레드 디코더가 깨질 수 있다(libavcodec/pthread_frame.c assertion).
+    분석 시작 시 한 cap으로 필요 프레임을 모두 디코드해두면 에이전트는 FFmpeg를
+    건드리지 않는다 — 1회 open으로 inspect_moment N회 호출을 처리한다.
+
+    반환: {round(peak_sec, 2): [pre, peak, post]} (피크 키는 canonical 2자리 반올림)
+    """
+    cache: dict[float, list] = {}
+    cap = cv2.VideoCapture(str(video_path))
+    try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-        out = []
-        for dt in (-off, 0.0, off):
-            idx = max(0, min(total - 1, int(round((time_sec + dt) * fps))))
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
-            if ok:
-                out.append(frame)
+        for s in segments:
+            ps = float(s["peak_sec"])
+            frames = []
+            for dt in (-off, 0.0, off):
+                idx = max(0, min(total - 1, int(round((ps + dt) * fps))))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if ok:
+                    frames.append(frame)
+            cache[round(ps, 2)] = frames
+    finally:
         cap.release()
-        return out
+    return cache
+
+
+def _make_frame_reader(cache: dict, video_path: str, fps: float):
+    """캐시된 프레임을 우선 조회하고, 캐시에 없는 시각은 새 cap을 잠깐 열어 폴백.
+
+    _snap_to_peak로 캐시 키에 정확히 매칭되도록 스냅하므로 폴백 경로는 거의
+    타지 않는다. 폴백도 한 번 open + 즉시 close라 idle 상태가 없다.
+    """
+    def read(time_sec: float, off: float = 0.4):
+        key = round(float(time_sec), 2)
+        if key in cache:
+            return cache[key]
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            out = []
+            for dt in (-off, 0.0, off):
+                idx = max(0, min(total - 1, int(round((time_sec + dt) * fps))))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ok, frame = cap.read()
+                if ok:
+                    out.append(frame)
+            return out
+        finally:
+            cap.release()
     return read
 
 
@@ -93,6 +150,18 @@ def _nearest_signals(segments: list[dict], time_sec: float) -> list[str]:
         return []
     near = min(segments, key=lambda s: abs(s["peak_sec"] - time_sec))
     return near.get("top_signals", []) if abs(near["peak_sec"] - time_sec) < 1.0 else []
+
+
+def _snap_to_peak(segments: list[dict], time_sec: float, tol: float = 0.6) -> float:
+    """에이전트가 넘긴 time_sec을 세그먼트의 canonical peak_sec(소수 둘째 자리)으로
+    스냅. 동일 값으로 round-trip되어야 report.peak_sec과 llm.peak_sec이 정확히
+    일치한다(이전에는 LLM이 1자리로 반올림해 ±0.6초 근사 매칭이 필요했음)."""
+    if not segments:
+        return float(time_sec)
+    near = min(segments, key=lambda s: abs(s["peak_sec"] - time_sec))
+    if abs(near["peak_sec"] - float(time_sec)) <= tol:
+        return float(near["peak_sec"])
+    return float(time_sec)
 
 
 @traceable(name="magic-trick-agent", run_type="chain")
@@ -127,10 +196,11 @@ def analyze(video_path: str, fps: float, segments: list[dict],
 
     library = [e for e in load_library() if _mode_ok(e["technique"])]
 
-    read_frames = _make_frame_reader(video_path, fps)
-    inspections: list[dict] = []
-    techniques_found: list[dict] = []
-    matches: list[dict] = []  # match_technique 호출 결과(데이터 기반 유사도)
+    # 분석 시작 시 모든 세그먼트 프레임을 한 cap으로 디코드해 메모리에 캐싱.
+    # 에이전트 루프(LLM 호출 사이 수초~수십초 idle)는 FFmpeg를 건드리지 않는다.
+    frame_cache = _prebuffer_segment_frames(video_path, fps, segments)
+    read_frames = _make_frame_reader(frame_cache, video_path, fps)
+    scratch = AgentScratch()
 
     @tool
     def list_suspect_moments() -> str:
@@ -138,34 +208,36 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         lines = []
         for i, s in enumerate(segments):
             sig = ", ".join(s.get("top_signals", [])) or "신호 없음"
-            lines.append(f"{i + 1}. {s['peak_sec']:.1f}s | 점수 {s.get('score', 0):.2f} "
+            # 소수 둘째 자리(canonical)까지 보여줘 round-trip이 정확하게 일치하도록.
+            lines.append(f"{i + 1}. {s['peak_sec']:.2f}s | 점수 {s.get('score', 0):.2f} "
                          f"| 신호: {sig}")
         return "탐지된 의심 순간:\n" + "\n".join(lines)
 
     @tool
     def inspect_moment(time_sec: float) -> str:
         """주어진 시각(초)의 프레임(직전/정점/직후)을 비전으로 분석해 손 동작 설명을 반환한다."""
-        if len(inspections) >= max_inspect:
+        if len(scratch.inspections) >= max_inspect:
             return "검토 한도에 도달했습니다. 지금까지의 관찰로 결론을 작성하세요."
-        frames = read_frames(float(time_sec))
+        t = _snap_to_peak(segments, float(time_sec))
+        frames = read_frames(t)
         if not frames:
-            return f"{time_sec:.1f}s 프레임을 읽지 못했습니다."
-        sig = _nearest_signals(segments, float(time_sec))
+            return f"{t:.2f}s 프레임을 읽지 못했습니다."
+        sig = _nearest_signals(segments, t)
         sig_txt = ("자동 탐지 신호: "
                    + ", ".join(f"{s}({SIGNAL_DESC[s].split(' — ')[0]})" for s in sig)) \
             if sig else "자동 탐지 신호: 특이사항 없음"
         labels = ["직전", "정점", "직후"][:len(frames)]
         content = [{"type": "text",
-                    "text": f"{MODE_KO.get(mode, mode)} {time_sec:.1f}초 부근. {sig_txt}.\n"
+                    "text": f"{MODE_KO.get(mode, mode)} {t:.2f}초 부근. {sig_txt}.\n"
                             f"프레임 순서: {'/'.join(labels)}."}]
         for fr in frames:
             content.append({"type": "image_url", "image_url": {"url": _data_url(fr)}})
-        vision = ChatOpenAI(model=model, max_tokens=350)
+        vision = ChatOpenAI(model=model, max_tokens=VISION_MAX_TOKENS)
         resp = vision.invoke([SystemMessage(content=VISION_SYSTEM),
                               HumanMessage(content=content)])
         desc = (resp.content or "").strip()
-        inspections.append({"peak_sec": float(time_sec), "hypothesis": desc,
-                            "top_signals": sig})
+        scratch.inspections.append({"peak_sec": t, "hypothesis": desc,
+                                    "top_signals": sig})
         return desc
 
     @tool
@@ -176,16 +248,16 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         e = lookup(technique)
         if e:
             d = entry_to_dict(e)
-            if not any(t["name_en"] == d["name_en"] for t in techniques_found):
-                techniques_found.append(d)
+            if not any(t["name_en"] == d["name_en"] for t in scratch.techniques_found):
+                scratch.techniques_found.append(d)
             return (f"{d['name_ko']} ({d['name_en']}, {d['type']})\n"
                     f"작동 원리: {d['desc']}\n관찰 단서: {d['cues']}\n"
                     f"참고 영상: {d['reference_url']}")
         url = search_url(technique)
-        if not any(t["name_en"] == technique for t in techniques_found):
-            techniques_found.append({"name_ko": technique, "name_en": technique,
-                                     "type": "", "desc": "(용어집에 없음 — 일반 지식 기반)",
-                                     "cues": "", "reference_url": url})
+        if not any(t["name_en"] == technique for t in scratch.techniques_found):
+            scratch.techniques_found.append({"name_ko": technique, "name_en": technique,
+                                             "type": "", "desc": "(용어집에 없음 — 일반 지식 기반)",
+                                             "cues": "", "reference_url": url})
         return f"'{technique}'은 용어집에 없습니다. 일반 지식으로 설명하고, 참고 영상: {url}"
 
     @tool
@@ -194,18 +266,19 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         유사도(0~1)를 반환한다. 비전 관찰과 별개의 데이터 기반 단서."""
         if not library:
             return "기법 예시 라이브러리가 비어 있습니다(등록된 예시 없음)."
-        sig = signature_from_video(video_path, float(time_sec))
+        t = _snap_to_peak(segments, float(time_sec))
+        sig = signature_from_video(video_path, t)
         if sig is None:
-            return f"{time_sec:.1f}s의 손 궤적을 얻지 못했습니다(손 미검출)."
+            return f"{t:.2f}s의 손 궤적을 얻지 못했습니다(손 미검출)."
         res = match(sig, library, k=3)
         if not res:
             return "유사한 기법을 찾지 못했습니다."
-        matches.append({"time_sec": round(float(time_sec), 2), "results": res})
+        scratch.matches.append({"time_sec": t, "results": res})
         return "라이브러리 매칭(유사도 0~1): " + ", ".join(
             f"{r['name_ko']} {r['similarity']:.2f}" for r in res)
 
     agent = create_react_agent(
-        ChatOpenAI(model=model, max_tokens=1500),
+        ChatOpenAI(model=model, max_tokens=AGENT_MAX_TOKENS),
         [list_suspect_moments, inspect_moment, explain_technique, match_technique],
         prompt=AGENT_SYSTEM,
     )
@@ -214,17 +287,18 @@ def analyze(video_path: str, fps: float, segments: list[dict],
             f"inspect_moment로 들여다본 뒤 전체 트릭과 핵심 비밀 동작을 종합 결론으로 쓰세요.")
     result = agent.invoke({"messages": [("user", task)]},
                           config={"recursion_limit": 4 * max_inspect + 16})
+
     summary = ""
     for m in reversed(result["messages"]):
         if getattr(m, "type", "") == "ai" and m.content:
             summary = m.content if isinstance(m.content, str) else str(m.content)
             break
 
-    analyses = sorted(inspections, key=lambda a: -_score_for(segments, a["peak_sec"]))
+    analyses = sorted(scratch.inspections, key=lambda a: -_score_for(segments, a["peak_sec"]))
     for a in analyses:
         a["score"] = round(_score_for(segments, a["peak_sec"]), 3)
     return {"analyses": analyses, "summary": summary,
-            "techniques": techniques_found, "matches": matches}
+            "techniques": scratch.techniques_found, "matches": scratch.matches}
 
 
 def _score_for(segments: list[dict], time_sec: float) -> float:
