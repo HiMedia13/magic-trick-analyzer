@@ -115,27 +115,55 @@ def main(argv: list[str] | None = None) -> int:
             print(f"      [경고] 자동 판별 실패({e}) → 기본 'card'로 진행",
                   file=sys.stderr)
 
-    # --- 1단계: 손 추적 ---
-    print(f"[1/3] 손 추적 중... ({video_path.name}, mode={args.mode})")
+    # --- 1단계: 손 추적 + 객체(카드/동전) 검출 ---
+    print(f"[1/3] 손 추적 + 객체 검출 중... ({video_path.name}, mode={args.mode})")
+    # 객체 검출 모델 미리 로드(첫 호출의 다운로드/초기화 비용을 진행률 메시지 전에).
+    try:
+        from .objects import warmup as obj_warmup, detect_objects
+        obj_ready = obj_warmup()
+        if obj_ready:
+            print("      객체 검출 모델 준비 완료")
+        else:
+            print("      객체 검출 비활성(YOLO 미사용) — 손 신호만 사용")
+    except Exception as e:
+        obj_ready = False
+        detect_objects = None  # type: ignore
+        print(f"      객체 검출 비활성: {e}")
+    # YOLO 추론은 프레임당 ~30ms라 매 프레임 돌리면 분 단위 추가됨. 신호는 전이
+    # 검출이라 stride=3(약 0.125s)에서도 vanish/appear를 충분히 잡는다.
+    obj_stride = 3
+
     cap, meta = open_video(video_path)
     total = meta.frame_count or 0
     if total:
         print(f"      길이 {meta.duration_sec:.0f}s, 약 {total}프레임 — 진행률 표시")
     frames = []
+    objects: list = []  # frames와 같은 길이로 유지(누락 프레임은 None)
     with HandTracker() as tracker:
         for fr in iter_frames(cap, meta.fps, stride=args.stride):
             frames.append(tracker.process(fr.index, fr.time_sec, fr.image))
+            if obj_ready and fr.index % obj_stride == 0:
+                objects.append(detect_objects(fr.image, fr.index, fr.time_sec,
+                                              mode=args.mode))
+            else:
+                objects.append(None)  # detect.py가 직전 상태로 carry-forward
             if total and fr.index and fr.index % 600 == 0:
                 print(f"      ...추적 {fr.index}/{total} ({100 * fr.index / total:.0f}%)")
     cap.release()
+    n_card_hits = sum(1 for o in objects if o and o.n_cards > 0)
+    n_coin_hits = sum(1 for o in objects if o and o.n_coins > 0)
     print(f"      처리 프레임: {len(frames)}장, fps={meta.fps:.1f}, "
           f"길이={meta.duration_sec:.1f}s")
+    if obj_ready:
+        print(f"      객체 검출: 카드 hit {n_card_hits}프레임, "
+              f"동전 hit {n_coin_hits}프레임 (stride={obj_stride})")
 
     # --- 2단계: 의심 구간 탐지 ---
     print("[2/3] 의심 구간 분석 중...")
     segments = detect(frames, meta.fps, mode=args.mode,
                       score_thresh=args.score_thresh, min_gap_sec=args.min_gap,
-                      window_sec=args.window, max_results=args.max_results)
+                      window_sec=args.window, max_results=args.max_results,
+                      objects=objects)
 
     report_txt = format_report(segments, meta, args.mode)
     print()

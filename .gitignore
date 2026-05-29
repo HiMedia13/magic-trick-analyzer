@@ -32,3 +32,6 @@ sample_smoke.mp4
 # OS
 .DS_Store
 Thumbs.db
+
+# project-reviewer 로컬 상태(리뷰 산출물)
+.reviewer/

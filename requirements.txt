@@ -8,3 +8,5 @@ langsmith>=0.1        # --llm: LangSmith 추적
 python-dotenv>=1.0    # .env 자동 로드(OPENAI_API_KEY, LANGSMITH_*)
 yt-dlp>=2024.1        # YouTube URL 입력 다운로드에만 필요
 flask>=3.0            # 웹 UI(webapp/app.py)에만 필요
+ultralytics>=8.0      # 객체 검출(카드 YOLOv8) — 없으면 OBJECT_CHANGE 신호 비활성
+huggingface_hub>=0.20 # 카드 detector 모델 다운로드(첫 1회)

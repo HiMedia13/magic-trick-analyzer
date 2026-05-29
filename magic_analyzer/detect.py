@@ -23,12 +23,15 @@ import numpy as np
 
 from .hands import FrameObs
 
-SIGNALS = ("VANISH", "BORDER", "CONTACT", "FAST", "GRAB")
+SIGNALS = ("VANISH", "BORDER", "CONTACT", "FAST", "GRAB", "OBJECT_CHANGE")
 
-# 마술 종류별 신호 가중치 (도메인 휴리스틱)
+# 마술 종류별 신호 가중치 (도메인 휴리스틱). OBJECT_CHANGE는 손 키네마틱 신호와
+# 독립이라 강하게(1.2~1.4) 줘서 매끄러운 슬레이트 보완.
 MODE_WEIGHTS = {
-    "card": {"VANISH": 1.0, "BORDER": 0.7, "CONTACT": 0.6, "FAST": 1.0, "GRAB": 0.7},
-    "coin": {"VANISH": 1.0, "BORDER": 0.6, "CONTACT": 1.0, "FAST": 0.5, "GRAB": 1.0},
+    "card": {"VANISH": 1.0, "BORDER": 0.7, "CONTACT": 0.6, "FAST": 1.0,
+             "GRAB": 0.7, "OBJECT_CHANGE": 1.4},
+    "coin": {"VANISH": 1.0, "BORDER": 0.6, "CONTACT": 1.0, "FAST": 0.5,
+             "GRAB": 1.0, "OBJECT_CHANGE": 1.2},
 }
 
 SIGNAL_DESC = {
@@ -37,6 +40,7 @@ SIGNAL_DESC = {
     "CONTACT": "두 손이 맞닿음 — 몰래 물건을 전달하거나 로드했을 수 있음",
     "FAST": "손이 순간적으로 빠르게 움직임 — 패스/던지기성 슬레이트 가능",
     "GRAB": "펼친 손이 갑자기 주먹이 됨 — 코인/카드 팜 가능",
+    "OBJECT_CHANGE": "카드/동전 객체 상태 급변 — 사라짐·등장·면적 급감 가능(객체 검출 기반)",
 }
 
 
@@ -79,6 +83,33 @@ def _center_at_border(center: np.ndarray, margin: float) -> bool:
     return x <= margin or y <= margin or x >= 1 - margin or y >= 1 - margin
 
 
+def _object_change(prev_obj, cur_obj, mode: str) -> float:
+    """객체 상태 급변 신호: count 변화 + 면적 비율 변화. 0~1.5 범위.
+
+    mode='card': YOLO 카드 개수/면적, mode='coin': Hough 원 개수.
+    객체 검출 결과가 없으면(None) 0.
+    """
+    if prev_obj is None or cur_obj is None:
+        return 0.0
+    if mode == "card" or mode == "auto":
+        # count 전이(예: 1장 보이다 사라지면 강한 신호)
+        diff = abs(cur_obj.n_cards - prev_obj.n_cards)
+        score = float(diff)  # 1장 변화 = 1.0
+        # 면적 급감/급증(40% 이상)
+        pa, ca = prev_obj.card_area, cur_obj.card_area
+        if max(pa, ca) > 0:
+            rel = abs(pa - ca) / max(pa, ca)
+            if rel > 0.4:
+                score += min(0.5, rel)
+        if score > 0:
+            return min(1.5, score)
+    if mode == "coin" or mode == "auto":
+        diff = abs(cur_obj.n_coins - prev_obj.n_coins)
+        if diff > 0:
+            return min(1.5, float(diff) * 0.5)  # 동전은 Hough라 noisier — 가중치 절반
+    return 0.0
+
+
 def score_timeline(
     frames: list[FrameObs],
     fps: float,
@@ -87,9 +118,12 @@ def score_timeline(
     fast_thresh: float = 1.6,
     grab_drop: float = 0.45,
     border_margin: float = 0.06,
+    objects: list | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, float]]]:
     """프레임별 신호 → 가중 점수(raw) → 스무딩(smooth)을 계산해 돌려준다.
 
+    `objects`: frames와 같은 길이의 ObjectObs 리스트(또는 None). 객체 검출이
+    비활성화된 환경에선 None을 넘기면 OBJECT_CHANGE만 0이 된다.
     반환: (times, smooth_score, per_frame_signals)
     """
     weights = MODE_WEIGHTS.get(mode, MODE_WEIGHTS["card"])
@@ -97,6 +131,10 @@ def score_timeline(
     times = np.array([f.time_sec for f in frames], dtype=np.float64)
     if n == 0:
         return times, np.zeros(0), []
+    # objects가 짧거나 None이면 안전하게 None으로 채움(인덱스 안전)
+    objs = list(objects) if objects else []
+    if len(objs) < n:
+        objs = objs + [None] * (n - len(objs))
 
     counts = [sum(1 for h in f.hands if not _center_at_border(h.center, border_margin))
               for f in frames]
@@ -104,6 +142,7 @@ def score_timeline(
     prev = None
     prev_open: dict[str, float] = {}
     prev_border = False  # 직전 프레임에 '가장자리 손'이 있었는지
+    prev_obj = None
 
     for i, f in enumerate(frames):
         sig = {s: 0.0 for s in SIGNALS}
@@ -136,6 +175,10 @@ def score_timeline(
                     sig["GRAB"] = max(sig["GRAB"], min(1.5, drop / grab_drop))
         prev_open = cur_open
 
+        # OBJECT_CHANGE: 카드/동전 객체 상태 전이
+        sig["OBJECT_CHANGE"] = _object_change(prev_obj, objs[i], mode)
+        prev_obj = objs[i] if objs[i] is not None else prev_obj  # 누락 프레임은 직전 상태 유지
+
         per_frame.append(sig)
         prev = f
 
@@ -161,10 +204,12 @@ def detect(
     min_gap_sec: float = 1.2,       # 봉우리 사이 최소 간격(NMS)
     window_sec: float = 0.8,        # 봉우리 앞뒤로 이만큼을 '구간'으로
     max_results: int | None = None,
+    objects: list | None = None,
 ) -> list[Segment]:
     times, smooth, per_frame = score_timeline(
         frames, fps, mode,
         fast_thresh=fast_thresh, grab_drop=grab_drop, border_margin=border_margin,
+        objects=objects,
     )
     n = len(smooth)
     if n == 0:
