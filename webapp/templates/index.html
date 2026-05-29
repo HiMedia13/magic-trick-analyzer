@@ -49,6 +49,25 @@
             overflow:auto; font-size:.78rem; color:var(--mut); white-space:pre-wrap; }
   .warn { font-size:.82rem; color:var(--mut); border-left:3px solid var(--accent);
           padding-left:10px; }
+  .labeler-wrap { margin-top:8px; padding-top:8px;
+                  border-top:1px dashed var(--line); }
+  .labeler-wrap > summary { list-style:none; cursor:pointer; color:var(--mut);
+                  font-size:.82rem; user-select:none; padding:2px 0;
+                  display:inline-flex; align-items:center; gap:6px; }
+  .labeler-wrap > summary::-webkit-details-marker { display:none; }
+  .labeler-wrap > summary::before { content:'＋'; font-size:.85rem;
+                  display:inline-block; width:14px; transition:transform .15s; }
+  .labeler-wrap[open] > summary::before { content:'－'; }
+  .labeler-wrap > summary:hover { color:var(--txt); }
+  .labeler-wrap.registered > summary { color:var(--ok); }
+  .labeler { display:flex; gap:6px; align-items:center; margin-top:6px;
+             flex-wrap:wrap; }
+  .labeler select, .labeler input[type=text] { background:#0d0f14;
+          border:1px solid var(--line); border-radius:6px; color:var(--txt);
+          padding:6px 8px; font-size:.85rem; }
+  .labeler button { margin:0; padding:6px 12px; font-size:.85rem; }
+  .labeler .ok { color:var(--ok); font-size:.85rem; }
+  .labeler .err { color:#ff9c9c; font-size:.85rem; }
 </style>
 </head>
 <body>
@@ -107,6 +126,142 @@ function fmt(t){ t=Number(t)||0; const m=Math.floor(t/60), s=(t%60); return Stri
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function safeUrl(u){ return (typeof u==='string' && /^https?:\/\//i.test(u)) ? u : ''; }
 function num(x){ return Number.isFinite(Number(x)) ? Number(x) : 0; }
+
+// 페이지 로드 시 한 번 받아두는 기법 목록(라벨 셀렉트용)
+let TECHNIQUES = [];
+fetch('/techniques').then(r => r.json()).then(d => { TECHNIQUES = d || []; })
+  .catch(() => { TECHNIQUES = []; });
+
+// "01:23.45" 또는 "83.45" 형태를 초 단위 float로 파싱. 빈 값/잘못된 값은 null.
+function parseTime(s){
+  s = String(s||'').trim();
+  if (!s) return null;
+  if (s.includes(':')) {
+    const parts = s.split(':');
+    if (parts.length !== 2) return null;
+    const m = parseFloat(parts[0]), sec = parseFloat(parts[1]);
+    if (!Number.isFinite(m) || !Number.isFinite(sec)) return null;
+    return m * 60 + sec;
+  }
+  const v = parseFloat(s);
+  return Number.isFinite(v) ? v : null;
+}
+
+// 마킹 영상의 현재 재생 시각을 manual labeler 입력칸에 채워넣음.
+// 멀티모드(card+coin)에서는 manual labeler 카드 바로 앞쪽 모드 블록의 영상을 사용.
+function useVideoTime(btn){
+  const card = btn.closest('.card');
+  let cur = card.previousElementSibling, video = null;
+  while (cur && !video){
+    const v = cur.querySelector('video');
+    if (v) video = v;
+    cur = cur.previousElementSibling;
+  }
+  if (!video) video = document.querySelector('video');  // 폴백
+  const input = btn.closest('.labeler').querySelector('input.time-input');
+  if (!video){ alert('영상이 없어 시점을 가져올 수 없어요.'); return; }
+  const t = Number(video.currentTime) || 0;
+  input.value = t.toFixed(2);
+}
+
+// 임의 시점 라벨 등록(탐지 못 한 구간 보완용). 시각 파싱 후 submitLabel 공통 흐름 재사용.
+async function submitManualLabel(jobId, btn){
+  const lab = btn.closest('.labeler');
+  const timeStr = lab.querySelector('input.time-input').value;
+  const peakSec = parseTime(timeStr);
+  const sel = lab.querySelector('select');
+  const free = lab.querySelector('input.tech-input');
+  const msg = lab.querySelector('.msg');
+  if (peakSec == null){
+    msg.className = 'msg err';
+    msg.textContent = '시각을 입력하세요 (예: 01:23.45 또는 83.45).';
+    return;
+  }
+  const technique = (free.value.trim() || sel.value || '').trim();
+  if (!technique){ msg.className = 'msg err'; msg.textContent = '기법을 선택하거나 입력하세요.'; return; }
+  btn.disabled = true; msg.className = 'msg mut'; msg.textContent = '시그니처 추출 중...';
+  try {
+    const r = await fetch('/label', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ job_id: jobId, peak_sec: peakSec, technique })
+    });
+    const d = await r.json();
+    if (d.ok){
+      msg.className = 'msg ok';
+      msg.textContent = `✓ 등록됨: ${d.name_ko} @ ${peakSec.toFixed(2)}s`;
+    } else {
+      msg.className = 'msg err'; msg.textContent = '실패: ' + (d.error || '알 수 없음');
+    }
+  } catch(e){
+    msg.className = 'msg err'; msg.textContent = '오류: ' + e.message;
+  } finally {
+    btn.disabled = false;  // 임의 시점은 여러 번 등록 가능(다른 시각·다른 기법)
+  }
+}
+
+// 한 모드 결과 카드 안에 들어갈 manual labeler 블록.
+function manualLabelerHtml(jobId){
+  const opts = TECHNIQUES.map(t => `<option value="${esc(t.en)}">${esc(t.ko)} (${esc(t.type)})</option>`).join('');
+  return `<div class="card">
+    <h3>📌 임의 시점 라벨링</h3>
+    <p class="mut" style="margin-top:0">탐지가 놓친 시점이 있다면 직접 시각과 기법을 지정해 추가하세요.</p>
+    <div class="labeler" style="border:0;padding:0">
+      <input type="text" class="time-input" placeholder="시각 (01:23.45 또는 83.45)" style="width:180px">
+      <button type="button" onclick="useVideoTime(this)" style="background:#2b2f3a">▶ 현재 영상 시점</button>
+      <select>${opts ? '<option value="">— 기법 선택 —</option>'+opts : '<option value="">기법 목록 로딩...</option>'}</select>
+      <input type="text" class="tech-input" placeholder="또는 직접 입력" style="flex:1;min-width:120px">
+      <button type="button" onclick="submitManualLabel('${esc(jobId)}', this)">라벨 등록</button>
+      <span class="msg mut" style="font-size:.85rem;flex-basis:100%"></span>
+    </div>
+  </div>`;
+}
+
+// 의심 시점에 사용자가 직접 기법 라벨을 붙여 라이브러리에 등록(active learning).
+async function submitLabel(jobId, peakSec, btn){
+  const wrap = btn.closest('.labeler-wrap');
+  const seg = wrap.closest('.seg');
+  const sel = seg.querySelector('.labeler select');
+  const free = seg.querySelector('.labeler input[type=text]');
+  const msg = seg.querySelector('.labeler .msg');
+  const summary = wrap.querySelector('summary');
+  const technique = (free.value.trim() || sel.value || '').trim();
+  if (!technique){ msg.className = 'msg err'; msg.textContent = '기법을 선택하거나 입력하세요.'; return; }
+  btn.disabled = true; msg.className = 'msg mut'; msg.textContent = '시그니처 추출 중...';
+  try {
+    const r = await fetch('/label', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ job_id: jobId, peak_sec: peakSec, technique })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      msg.className = 'msg ok';
+      msg.textContent = `✓ 등록됨: ${d.name_ko} @ ${peakSec.toFixed(2)}s`;
+      // 등록 성공 시 summary에 결과 표기 + 시각적 강조
+      wrap.classList.add('registered');
+      summary.textContent = `✓ 라벨 등록됨: ${d.name_ko}`;
+    } else {
+      msg.className = 'msg err'; msg.textContent = '실패: ' + (d.error || '알 수 없음');
+      btn.disabled = false;
+    }
+  } catch (e){
+    msg.className = 'msg err'; msg.textContent = '오류: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+// segment의 라벨러 HTML — 기본은 접힘. summary 클릭 시 펼쳐져 라벨 입력 가능.
+function labelerHtml(jobId, peakSec){
+  const opts = TECHNIQUES.map(t => `<option value="${esc(t.en)}">${esc(t.ko)} (${esc(t.type)})</option>`).join('');
+  return `<details class="labeler-wrap"><summary>기법 라벨링</summary>
+    <div class="labeler">
+      <span class="mut" style="font-size:.85rem">이 시점 기법:</span>
+      <select>${opts ? '<option value="">— 선택 —</option>'+opts : '<option value="">기법 목록 로딩...</option>'}</select>
+      <input type="text" placeholder="또는 직접 입력" style="flex:1;min-width:120px">
+      <button type="button" onclick="submitLabel('${esc(jobId)}', ${num(peakSec)}, this)">라벨 등록</button>
+      <span class="msg mut" style="font-size:.85rem"></span>
+    </div>
+  </details>`;
+}
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -213,6 +368,9 @@ function renderMode(jobId, r){
       <video controls src="${base}/annotated.webm"></video></div>`;
   }
 
+  // 탐지가 놓친 시점을 사람이 직접 라벨링 — 자동 탐지의 false negative 보완
+  html += manualLabelerHtml(jobId);
+
   html += `<div class="card"><h3>의심 구간 타임라인</h3>`;
   if (!segs.length) html += `<p class="mut">의심 구간을 찾지 못했습니다.</p>`;
   segs.forEach((s, i) => {
@@ -223,6 +381,7 @@ function renderMode(jobId, r){
         <span class="mut">정점 ${fmt(s.peak_sec)} · 점수 ${score}</span></div>
       <div class="badges">${badges}</div>
       ${s.inference ? `<div class="infer">🤖 ${esc(s.inference)}</div>` : ''}
+      ${labelerHtml(jobId, num(s.peak_sec))}
     </div>`;
   });
   html += `</div>`;
