@@ -33,7 +33,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from magic_analyzer.fetch import resolve_video_input  # noqa: E402
-from magic_analyzer.library import save_entry, signature_from_video  # noqa: E402
+from magic_analyzer.library import (LIBRARY_PATH, load_library,  # noqa: E402
+                                    save_entry, signature_from_video)
 from magic_analyzer.techniques import lookup  # noqa: E402
 
 
@@ -175,10 +176,87 @@ def _force_utf8():
         pass
 
 
+def _already_processed_ids() -> set[str]:
+    """이미 STT로 라벨링한 video_id 집합. source='stt:<vid>@...' 패턴에서 추출."""
+    ids: set[str] = set()
+    for entry in load_library(LIBRARY_PATH):
+        src = entry.get("source", "")
+        if src.startswith("stt:"):
+            # 형식: stt:<video_id>@<time>|<text>
+            tail = src[4:]
+            vid = tail.split("@", 1)[0]
+            if vid:
+                ids.add(vid)
+    return ids
+
+
+def expand_urls(inputs: list[str], *, limit: int | None,
+                min_duration: int, max_duration: int,
+                skip_processed: bool) -> list[str]:
+    """단일 영상/채널/플레이리스트 URL을 개별 영상 URL 리스트로 펼침.
+
+    - 단일 영상은 그대로 통과
+    - 채널/playlist는 yt_dlp flat 추출로 엔트리 펼침
+    - duration 필터(min/max), 개수 제한(limit), 이미 처리된 id 스킵 적용
+    """
+    import yt_dlp
+
+    processed = _already_processed_ids() if skip_processed else set()
+    if processed:
+        print(f"[중복 스킵 활성] 이미 처리된 video_id {len(processed)}개")
+
+    out: list[str] = []
+    opts = {
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "extract_flat": True,
+    }
+    for url in inputs:
+        # 로컬 파일이면 그대로
+        if not (url.startswith("http://") or url.startswith("https://")):
+            out.append(url)
+            continue
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        entries = info.get("entries")
+        # 단일 영상: entries 없거나 _type='video'
+        if not entries:
+            out.append(url)
+            continue
+        # 채널/플레이리스트
+        title = info.get("title", "(제목 미상)")
+        print(f"\n[채널/플레이리스트] {title} — {len(entries)}개 영상 발견")
+        kept = 0
+        skipped_dur, skipped_proc = 0, 0
+        for e in entries:
+            vid = e.get("id")
+            dur = e.get("duration") or 0
+            if not vid:
+                continue
+            if dur and (dur < min_duration or dur > max_duration):
+                skipped_dur += 1
+                continue
+            if vid in processed:
+                skipped_proc += 1
+                continue
+            video_url = e.get("url") or f"https://www.youtube.com/watch?v={vid}"
+            out.append(video_url)
+            processed.add(vid)  # 같은 채널 안 중복도 막음
+            kept += 1
+            if limit and kept >= limit:
+                break
+        print(f"  채택 {kept}, 길이 필터 스킵 {skipped_dur}, "
+              f"이미 처리됨 스킵 {skipped_proc}")
+    return out
+
+
 def main():
     _force_utf8()
-    ap = argparse.ArgumentParser(description="음성 자막 기반 자동 라이브러리 라벨링")
-    ap.add_argument("videos", nargs="+", help="YouTube URL 또는 로컬 영상 경로")
+    ap = argparse.ArgumentParser(
+        description="음성 자막 기반 자동 라이브러리 라벨링 "
+                    "(YouTube 단일 영상·채널·플레이리스트 모두 지원)")
+    ap.add_argument("videos", nargs="+",
+                    help="YouTube 영상/채널/플레이리스트 URL 또는 로컬 영상 경로. "
+                         "채널/플레이리스트는 자동으로 영상 목록을 펼침.")
     ap.add_argument("--model", default="small",
                     choices=["tiny", "base", "small", "medium", "large-v3"],
                     help="Whisper 모델 크기 (기본 small)")
@@ -188,17 +266,39 @@ def main():
                     help="추출한 WAV 캐시 위치")
     ap.add_argument("--dry-run", action="store_true",
                     help="시그니처 추출/등록 없이 후보만 출력")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="채널/플레이리스트당 처리할 최대 영상 수 (비용/시간 제어)")
+    ap.add_argument("--min-duration", type=int, default=30,
+                    help="이 초 미만 영상은 스킵 — shorts 등 (기본 30)")
+    ap.add_argument("--max-duration", type=int, default=1200,
+                    help="이 초 초과 영상은 스킵 — 너무 긴 영상 제외 (기본 1200=20분)")
+    ap.add_argument("--no-skip-processed", action="store_true",
+                    help="이미 STT로 처리된 영상도 재처리(기본은 스킵)")
     args = ap.parse_args()
 
+    print("[입력 펼치기]")
+    expanded = expand_urls(
+        args.videos,
+        limit=args.limit,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration,
+        skip_processed=not args.no_skip_processed,
+    )
+    print(f"\n[처리 대상 {len(expanded)}개]")
+    if not expanded:
+        print("  처리할 영상이 없습니다 (모두 스킵됨).")
+        return 0
+
     total = 0
-    for v in args.videos:
+    for i, v in enumerate(expanded, 1):
+        print(f"\n--- [{i}/{len(expanded)}] ---")
         try:
             total += auto_label_one(v, args.model, args.offset,
                                     Path(args.audio_cache), args.dry_run)
         except Exception as e:
-            print(f"\n[오류] {v}: {e}", file=sys.stderr)
+            print(f"[오류] {v}: {e}", file=sys.stderr)
 
-    print(f"\n=== 전체 완료: {total}개 라벨 추가 ===")
+    print(f"\n=== 전체 완료: {total}개 라벨 추가 ({len(expanded)}개 영상 처리) ===")
     return 0
 
 

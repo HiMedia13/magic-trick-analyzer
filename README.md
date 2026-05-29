@@ -179,12 +179,20 @@ python scripts/build_library.py --technique "프렌치 드롭" --video coin.mp4 
 # YouTube URL(들) → 자동 다운로드 → Whisper 전사 → 기법 언급 검출 → 시그니처 등록
 python scripts/auto_label.py "https://youtu.be/URL1" "https://youtu.be/URL2"
 
+# 채널/플레이리스트 URL을 그대로 — 영상 목록을 자동으로 펼침
+python scripts/auto_label.py "https://www.youtube.com/@MaskedMagicSecretsRevealed/videos" --limit 5
+
 # 후보만 보고 등록은 건너뛰기(검토용)
 python scripts/auto_label.py "https://youtu.be/URL" --dry-run
 
 # 해설자가 시연 직후에 말하는 경향이면 음수 offset으로 시점 보정
 python scripts/auto_label.py "https://youtu.be/URL" --offset -2.0
 ```
+
+채널 URL을 넘기면 `yt_dlp` flat-playlist로 영상 목록을 펼친 뒤 길이 필터
+(`--min-duration`/`--max-duration`)와 개수 제한(`--limit`)을 적용합니다. 이미 STT로
+라벨링한 video_id는 자동으로 스킵해 같은 영상을 두 번 처리하지 않습니다
+(`--no-skip-processed`로 비활성).
 
 faster-whisper로 영어 자막을 추출하고 `techniques.lookup()`의 별칭 매칭으로 기법명을
 찾아 부정문/도입부 문장을 자동 제외합니다. 등록된 라벨은 `source=stt:<id>@<sec>|<문장>`로
