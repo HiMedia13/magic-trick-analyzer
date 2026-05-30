@@ -63,6 +63,29 @@ _RANK_RE = {r: re.compile("|".join(pats), re.I) for r, pats in _RANK_PATTERNS.it
 _SUIT_RE = {s: re.compile("|".join(pats), re.I) for s, pats in _SUIT_PATTERNS.items()}
 
 
+# Whisper 흔한 hallucination 보정. 마술 카드명을 잘못 듣는 패턴들.
+# (small 모델이 마술 영상의 노이즈/음악 때문에 카드명을 자주 잘못 들음)
+_STT_FIXES = [
+    # "clubs"의 wild misspellings
+    (re.compile(r"\be[\- ]?clover\b", re.I), "of clubs"),
+    (re.compile(r"\belf clover\b", re.I), "of clubs"),
+    (re.compile(r"\bofclubs?\b", re.I), "of clubs"),
+    # "spades" 흔한 오인
+    (re.compile(r"\b(spade|spaids?)\b", re.I), "spades"),
+    # "diamonds"
+    (re.compile(r"\b(daimonds?|dimonds?)\b", re.I), "diamonds"),
+    # "hearts"
+    (re.compile(r"\b(harts?|hurts?)\b", re.I), "hearts"),
+]
+
+
+def _apply_stt_fixes(text: str) -> str:
+    """전사 텍스트에 흔한 카드 misspelling 보정 적용."""
+    for pat, repl in _STT_FIXES:
+        text = pat.sub(repl, text)
+    return text
+
+
 def _find_card_in_text(text: str) -> str | None:
     """텍스트에 'rank of suit' 패턴이 있으면 'RankSuit'(예: 'QH') 반환."""
     found_rank = None
@@ -86,12 +109,17 @@ def _find_card_in_text(text: str) -> str | None:
 # ---------- 선택 구문 패턴 ----------
 _SELECTION_PATTERNS = {
     "select": re.compile(
-        r"\b(pick a card|choose a card|select a card|take a card|your card)\b",
+        r"\b(pick a card|choose a card|select a card|take a card"
+        r"|remember your card|memorize your card)\b",
         re.I,
     ),
+    # reveal: 'card' 단어가 같이 있는 강한 매칭만. 'this is the' 같은 일반
+    # 영어 표현 제거(false positive 원인).
     "reveal": re.compile(
-        r"\b(your card is|the card you chose|the card was|here.s your card"
-        r"|i.ll show you|it.s the)\b",
+        r"\b(your card is|the card you chose|the card was|here.?s your card"
+        r"|this card chose|the card chose|chose the card|only one card"
+        r"|the chosen card|the selected card|reveal.{0,15}card"
+        r"|card.{0,10}is the|card.{0,10}was the)\b",
         re.I,
     ),
     "audience": re.compile(
@@ -102,13 +130,19 @@ _SELECTION_PATTERNS = {
 
 
 def find_card_mentions(segments) -> list[CardMention]:
-    """전사 세그먼트(start, end, text)에서 카드 이름 언급 추출."""
+    """전사 세그먼트(start, end, text)에서 카드 이름 언급 추출.
+    STT misspelling 보정 후 다시 시도해서 회수율 ↑."""
     out: list[CardMention] = []
     for s in segments:
         text = (getattr(s, "text", "") or "").strip()
         if not text:
             continue
         cid = _find_card_in_text(text)
+        if not cid:
+            # 보정 적용 후 재시도
+            fixed = _apply_stt_fixes(text)
+            if fixed != text:
+                cid = _find_card_in_text(fixed)
         if cid:
             mid = (s.start + s.end) / 2
             out.append(CardMention(time_sec=float(mid), card_id=cid, text=text))

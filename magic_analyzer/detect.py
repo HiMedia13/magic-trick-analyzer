@@ -83,6 +83,29 @@ def _center_at_border(center: np.ndarray, margin: float) -> bool:
     return x <= margin or y <= margin or x >= 1 - margin or y >= 1 - margin
 
 
+def _is_spread_around(objs: list, idx: int, window: int = 10,
+                      min_unique_cards: int = 3) -> bool:
+    """주변 ±window 프레임에 face-up 카드가 `min_unique_cards`종 이상 동시에
+    보이면 spread/fan 동작으로 판정.
+
+    카드 펼치기는 정상 마술 액션이지 슬레이트가 아니라서 의심 점수가 부풀려져
+    false positive를 만든다(FAST/OBJECT_CHANGE 둘 다 spread 중에 강하게 발화).
+    window=10 (±0.4s @ 24fps stride=3) — spread 동작 전형적 지속 시간.
+    """
+    if not objs:
+        return False
+    lo = max(0, idx - window)
+    hi = min(len(objs), idx + window + 1)
+    unique: set = set()
+    for o in objs[lo:hi]:
+        if o is None:
+            continue
+        unique.update(o.card_ids)
+        if len(unique) >= min_unique_cards:
+            return True
+    return False
+
+
 def _object_change(prev_obj, cur_obj, mode: str) -> float:
     """객체 상태 급변 신호: count 변화 + 면적 비율 변화. 0~1.5 범위.
 
@@ -178,6 +201,15 @@ def score_timeline(
         # OBJECT_CHANGE: 카드/동전 객체 상태 전이
         sig["OBJECT_CHANGE"] = _object_change(prev_obj, objs[i], mode)
         prev_obj = objs[i] if objs[i] is not None else prev_obj  # 누락 프레임은 직전 상태 유지
+
+        # SPREAD 감점: 주변 프레임에 face-up 카드가 3종 이상 동시에 보이면
+        # 'spread/fan' 정상 동작 — 모든 신호 가중치 0.15로(=85% 감점). spread
+        # 시점은 score_thresh를 못 넘어 의심 후보에서 사실상 제외됨. FAST/
+        # OBJECT_CHANGE가 spread 중 강하게 false positive로 발화하는 게
+        # 사용자가 직접 발견한 문제(예: RcUhJTUC7jg 11.10s 5종 카드 동시).
+        if mode in ("card", "auto") and _is_spread_around(objs, i):
+            for s in SIGNALS:
+                sig[s] *= 0.15
 
         per_frame.append(sig)
         prev = f

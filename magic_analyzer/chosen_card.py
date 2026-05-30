@@ -123,89 +123,114 @@ def identify_chosen_card(card_timeline: CardTimeline,
                          mentions: list[CardMention] | None = None,
                          selection_phrases: list[SelectionPhrase] | None = None,
                          ) -> ChosenCardEvidence:
-    """다중 신호로 chosen card 식별.
+    """다중 신호로 chosen card 식별 — **우선순위 기반**.
 
-    의사결정:
-      1) 시각 prominence_events 추출. 후보 = 거기 등장한 카드들.
-      2) 후보별 점수 = (총 prominence 점수)
-         + 음성 언급 보너스 (그 카드가 텍스트로 언급되면 + 큰 값)
-         + 관객 손 이벤트 근접 보너스 (5초 내에 관객 손 있으면 +)
-      3) 최고 점수 카드 선택, 신뢰도는 사용된 신호 수로 결정:
-         - 시각 + 음성 + 관객손 → high
-         - 시각 + 음성 → medium
-         - 시각만 → low
-         - 후보 없음 → none
+    이전 단순 누적 점수는 '마술사가 자주 보여주는 디스플레이 카드'(예: QH가
+    26회 등장)가 '관객이 한 번 선택한 진짜 카드'(예: 2C가 처음 길게 등장 후
+    reveal에서 다시 등장)를 이기는 문제가 있었음.
+
+    재설계 의사결정 (먼저 매칭되는 규칙이 이김):
+      [0순위] reveal 음성 구문("your card is", "this card chose" 등) ±5초 안에
+              prominent 등장 카드 = 관객 카드 (가장 강한 신호 — 마술의 의도된
+              reveal 모먼트). 음성 mention까지 일치하면 high, 아니면 medium.
+      [1순위] 음성에서 명시적으로 언급된 카드(rank+suit) 중 prominent 등장도
+              있는 것. medium.
+      [2순위] 관객 손 이벤트 직후(~5초) 첫 prominent 등장 카드. low~medium.
+      [폴백]  단순 누적(이전 휴리스틱). low.
     """
+    audience_events = detect_audience_hand_events(frames or [])
+    ae_first = audience_events[0] if audience_events else None
     events = card_timeline.prominence_events() if card_timeline else []
-    if not events:
+    mentions = mentions or []
+    selection_phrases = selection_phrases or []
+    reveal_phrases = [p for p in selection_phrases if p.phrase_kind == "reveal"]
+
+    def _make(card_id, conf, sel_ev, rev_ev, audio_m, ae_m, rationale):
         return ChosenCardEvidence(
-            card_id=card_timeline.chosen_card() if card_timeline else None,
-            confidence="low" if card_timeline and card_timeline.appearances else "none",
-            selection_event=None, reveal_event=None,
-            audio_mention=None, audience_hand_event=None,
-            rationale="시각 prominent 이벤트가 없어 카드 타임라인의 chosen_card 휴리스틱으로 폴백.",
+            card_id=card_id, confidence=conf,
+            selection_event=sel_ev, reveal_event=rev_ev,
+            audio_mention=audio_m, audience_hand_event=ae_m,
+            rationale=rationale,
         )
 
-    # 카드별 prominence 점수 집계
-    score_by_card: dict[str, float] = {}
-    for e in events:
-        score_by_card[e.card_id] = score_by_card.get(e.card_id, 0.0) + e.score
+    def _card_events_of(cid):
+        return [e for e in events if e.card_id == cid]
 
-    # 음성 언급 보너스
-    mention_set = {m.card_id for m in (mentions or [])}
-    for cid in list(score_by_card):
-        if cid in mention_set:
-            score_by_card[cid] *= 2.5  # 음성과 시각이 합의 = 강력 보너스
+    # ===== [0순위] reveal 음성 구문 ± 5초 안의 "드문" prominent 카드 =====
+    # 핵심 통찰: 관객 카드는 영상 전체에서 적게 등장(selection 1회 + reveal 1회).
+    # 마술사 디스플레이 카드(예: QH가 26회 등장)는 자주 보여지므로 reveal 시점에
+    # 가장 가까운 게 디스플레이 카드일 수 있음 → '시간 가까움'으로만 뽑으면
+    # 진짜 관객 카드를 놓침.
+    #
+    # 정렬 우선순위:
+    #   1) 전체 등장 횟수 적음 (rare = 관객 카드 패턴)
+    #   2) 시간 가까움
+    #   3) 면적 큼
+    # 영상 후반부 reveal 우선(마지막 reveal일수록 진짜 reveal일 가능성 ↑).
+    for rp in sorted(reveal_phrases, key=lambda p: -p.time_sec):
+        nearby = [e for e in events if abs(e.time_sec - rp.time_sec) <= 5.0]
+        if not nearby:
+            continue
+        nearby.sort(key=lambda e: (
+            len(card_timeline.timeline_for(e.card_id)),  # 전체 등장 횟수 적음 우선
+            abs(e.time_sec - rp.time_sec),                # 시간 가까움
+            -e.max_area,                                   # 면적 큼
+        ))
+        chosen = nearby[0].card_id
+        ce = _card_events_of(chosen)
+        sel_ev = ce[0] if ce else None
+        rev_ev = ce[-1] if ce else None
+        audio_m = next((m for m in mentions if m.card_id == chosen), None)
+        conf = "high" if audio_m else "medium"
+        total_appearances = len(card_timeline.timeline_for(chosen))
+        parts = [
+            f"reveal 음성 @ {rp.time_sec:.2f}s ('{rp.text[:60]}') ± 5초 안에 "
+            f"{chosen} prominent 등장(@ {nearby[0].time_sec:.2f}s)",
+            f"+ {chosen}는 영상 전체 {total_appearances}회 등장(드문 카드 = 관객 카드 패턴)",
+        ]
+        if audio_m:
+            parts.append(f"+ 음성에서 {chosen} 명시 언급 일치 ('{audio_m.text[:50]}')")
+        if ae_first:
+            parts.append(f"관객 손 이벤트 @ {ae_first.start_sec:.2f}s")
+        return _make(chosen, conf, sel_ev, rev_ev, audio_m, ae_first,
+                     " | ".join(parts))
 
-    # 관객 손 이벤트 (전체에 1개라도 있으면 시각 첫 이벤트 근처 카드에 보너스)
-    audience_events = detect_audience_hand_events(frames or [])
-    if audience_events:
-        # 가장 이른 관객 손 이벤트 근처의 시각 prominence 카드에 보너스
-        first_ae = audience_events[0]
-        for e in events:
-            if abs(e.time_sec - first_ae.mid) <= 5.0:
-                score_by_card[e.card_id] = score_by_card.get(e.card_id, 0) * 1.4
+    # ===== [1순위] 음성 언급 + prominent 등장 모두 있는 카드 =====
+    mention_cards = {m.card_id for m in mentions}
+    candidates = [cid for cid in mention_cards if _card_events_of(cid)]
+    if candidates:
+        # 음성 언급된 카드 중 prominent 노출이 가장 긴 것
+        candidates.sort(
+            key=lambda c: -sum(e.duration for e in _card_events_of(c)))
+        chosen = candidates[0]
+        ce = _card_events_of(chosen)
+        audio_m = next(m for m in mentions if m.card_id == chosen)
+        parts = [f"음성 언급 {chosen} ('{audio_m.text[:60]}') + 시각 "
+                 f"{len(ce)}회 prominent 등장"]
+        if ae_first:
+            parts.append(f"관객 손 이벤트 @ {ae_first.start_sec:.2f}s")
+        return _make(chosen, "medium", ce[0], ce[-1], audio_m, ae_first,
+                     " | ".join(parts))
 
-    chosen_id = max(score_by_card, key=score_by_card.get) if score_by_card else None
+    # ===== [2순위] 관객 손 이벤트 직후(5초) 첫 prominent 카드 =====
+    if ae_first and events:
+        after_ae = [e for e in events if e.time_sec >= ae_first.mid and
+                    e.time_sec - ae_first.mid <= 5.0]
+        if after_ae:
+            after_ae.sort(key=lambda e: e.time_sec)
+            chosen = after_ae[0].card_id
+            ce = _card_events_of(chosen)
+            rationale = (f"관객 손 이벤트 @ {ae_first.start_sec:.2f}s 직후 "
+                         f"{after_ae[0].time_sec:.2f}s에 {chosen} prominent 등장")
+            return _make(chosen, "low", ce[0], ce[-1], None, ae_first, rationale)
 
-    # 그 카드의 첫/마지막 시각 이벤트
-    card_events = [e for e in events if e.card_id == chosen_id]
-    sel_ev = card_events[0] if card_events else None
-    rev_ev = card_events[-1] if card_events else None
+    # ===== [폴백] 단순 누적 휴리스틱 =====
+    if card_timeline and card_timeline.appearances:
+        chosen = card_timeline.chosen_card()
+        ce = _card_events_of(chosen) if chosen else []
+        rationale = ("음성/관객손 단서 부족 → 단순 누적(총 노출 × √면적) 휴리스틱. "
+                     "마술사가 디스플레이 용도로 자주 보여주는 카드일 수 있어 신뢰도 낮음.")
+        return _make(chosen, "low", ce[0] if ce else None,
+                     ce[-1] if ce else None, None, ae_first, rationale)
 
-    audio_match = next((m for m in (mentions or []) if m.card_id == chosen_id),
-                      None)
-    ae_match = audience_events[0] if audience_events else None
-
-    # 신뢰도 등급
-    signals = sum([sel_ev is not None, audio_match is not None, ae_match is not None])
-    if signals >= 3:
-        conf = "high"
-    elif signals == 2:
-        conf = "medium"
-    elif signals == 1:
-        conf = "low"
-    else:
-        conf = "none"
-
-    parts = []
-    if sel_ev:
-        parts.append(f"시각 prominent {len(card_events)}회 등장 "
-                     f"(첫 {sel_ev.time_sec:.2f}s, 마지막 {rev_ev.time_sec:.2f}s)")
-    if audio_match:
-        parts.append(f"음성 언급 @ {audio_match.time_sec:.2f}s "
-                     f"(\"{audio_match.text[:50]}\")")
-    if ae_match:
-        parts.append(f"관객 손 등장 @ {ae_match.start_sec:.2f}~{ae_match.end_sec:.2f}s "
-                     f"(최대 {ae_match.max_n_hands}손)")
-    rationale = " | ".join(parts) if parts else "신호 없음"
-
-    return ChosenCardEvidence(
-        card_id=chosen_id,
-        confidence=conf,
-        selection_event=sel_ev,
-        reveal_event=rev_ev,
-        audio_mention=audio_match,
-        audience_hand_event=ae_match,
-        rationale=rationale,
-    )
+    return _make(None, "none", None, None, None, None, "신호 없음")
