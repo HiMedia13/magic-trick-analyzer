@@ -414,10 +414,27 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         return "\n".join(parts)
 
     # ===== Deep Agent를 LangGraph StateGraph로 구성 =====
-    # 단일 ReAct 루프 대신 SCAN→HYPOTHESIZE→VERIFY→REVISE→CONCLUDE 5개 노드로
-    # 흐름을 강제. 각 노드는 자기 단계에 필요한 도구만 갖는 sub-agent로 동작.
+    # NARRATIVE → SCAN → HYPOTHESIZE → VERIFY → REVISE → CONCLUDE 6노드.
+    # NARRATIVE는 영상 전체를 큰 그림으로 한 번 본 뒤 trick effect와 narrative
+    # arc를 추론 — 후속 노드들이 이를 context로 사용해 'spread' false positive 등
+    # bottom-up 신호만으론 어려운 판단을 도움.
 
     mode_ko = MODE_KO.get(mode, mode)
+
+    # NARRATIVE 노드 — 균등 샘플 프레임으로 영상 전체 한 번 분석.
+    NARRATIVE_SYSTEM = (
+        "당신은 마술 분석 전문가입니다. 균등 간격으로 샘플된 프레임들을 보고 "
+        "이 영상의 전체 narrative arc를 추론합니다. 특정 기법을 단정하지 말고, "
+        "큰 흐름과 효과(effect)에 집중하세요. 후속 단계에서 세부 분석이 이어집니다."
+    )
+    # 영상 총 길이를 비디오 메타에서 정확히 얻기 — segments에는 reveal 부근까지
+    # 모두 포함된다는 보장이 없음.
+    _cap = cv2.VideoCapture(str(video_path))
+    try:
+        total_frames = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+        duration_sec = total_frames / fps
+    finally:
+        _cap.release()
 
     SCAN_PROMPT = (
         f"당신은 {mode_ko} 영상의 **SCAN 단계** 분석가입니다. "
@@ -476,6 +493,7 @@ def analyze(video_path: str, fps: float, segments: list[dict],
 
     # ----- State 정의 -----
     class DeepAgentState(TypedDict, total=False):
+        narrative: str
         scan: str
         hypotheses: str
         verifications: str
@@ -490,59 +508,131 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         return ""
 
     # ----- 노드 함수 -----
+    @traceable(name="deep-narrative", run_type="chain")
+    def narrative_node(state: DeepAgentState) -> dict:
+        """균등 간격 10프레임을 한 번에 vision LLM에 던져 narrative arc 추론."""
+        n_samples = 10
+        cap = cv2.VideoCapture(str(video_path))
+        frames_at: list[tuple[float, "cv2.typing.MatLike"]] = []
+        try:
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            # 인덱스로 균등 샘플(처음/끝 제외해서 안정 프레임)
+            idxs = [int(total * (i + 0.5) / n_samples) for i in range(n_samples)]
+            for i in idxs:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                ok, fr = cap.read()
+                if ok:
+                    frames_at.append((i / fps, fr))
+        finally:
+            cap.release()
+        if not frames_at:
+            return {"narrative": "프레임 샘플링 실패 — narrative 생략."}
+
+        # 음성 단서가 있으면 컨텍스트로 추가(전체 전사가 아니라 reveal 구문 정도)
+        audio_ctx = ""
+        if chosen_evidence is not None:
+            if chosen_evidence.audio_mention:
+                audio_ctx = (f"\n음성에서 언급된 카드: {chosen_evidence.audio_mention.card_id} "
+                             f"(\"{chosen_evidence.audio_mention.text[:80]}\")")
+            elif chosen_evidence.card_id:
+                audio_ctx = f"\n추정 chosen card(다중 신호): {chosen_evidence.card_id}"
+
+        content: list[dict] = [{"type": "text", "text": (
+            f"이 {mode_ko} 영상의 균등 샘플 {len(frames_at)}프레임 (시각순). "
+            f"영상 길이 약 {duration_sec:.1f}초.{audio_ctx}\n\n"
+            "다음을 구조화한 한국어 narrative로 답하세요:\n\n"
+            "**Effect (트릭 효과)**: vanish / production / transposition / "
+            "transformation / prediction / ambitious / restoration 중 가장 가까운 "
+            "카테고리 + 한 줄 설명\n\n"
+            "**Narrative beats**: 영상 흐름의 핵심 사건들 (시각순). 형식 "
+            "'@<시각>: <사건>'. 가능한 beat 카테고리:\n"
+            "  - setup (덱·도구 보여주기)\n"
+            "  - selection (관객이 카드/물건 선택)\n"
+            "  - control/manipulation (마술사 비밀 조작)\n"
+            "  - vanish/transform 등 핵심 변화\n"
+            "  - reveal (결과 공개)\n\n"
+            "**추정 기법 카테고리**: 각 beat에 어떤 종류의 기법이 들어갈 만한지 "
+            "(구체 기법명을 단정하지 말 것).\n\n"
+            "특정 시점의 미세 동작은 무시. 큰 흐름·효과가 무엇인지가 목표."
+        )}]
+        for t, fr in frames_at:
+            content.append({"type": "text", "text": f"@ {t:.1f}s:"})
+            content.append({"type": "image_url",
+                            "image_url": {"url": _data_url(fr)}})
+
+        # 별도 LLM 호출 — sub-agent의 prompt를 거치지 않고 직접 vision
+        vision = ChatOpenAI(model=model, max_tokens=1500)
+        resp = vision.invoke([SystemMessage(content=NARRATIVE_SYSTEM),
+                              HumanMessage(content=content)])
+        return {"narrative": (resp.content or "").strip()}
+
     @traceable(name="deep-scan", run_type="chain")
     def scan_node(state: DeepAgentState) -> dict:
-        msg = (f"이 {mode_ko} 영상의 의심 시점과 chosen card를 파악하세요. "
-               "두 도구를 모두 호출한 뒤 결과를 정리해 보고하세요.")
+        msg = (f"[NARRATIVE 단계 결과 — 영상 전체 흐름]\n"
+               f"{state.get('narrative', '(없음)')}\n\n"
+               f"위 narrative를 참고하면서 이 {mode_ko} 영상의 의심 시점과 chosen "
+               "card를 파악하세요. 두 도구를 모두 호출한 뒤 결과를 정리해 보고하세요. "
+               "narrative에 명시된 beat 시각과 의심 시점이 겹치면 그걸 메모.")
         r = scan_agent.invoke({"messages": [("user", msg)]},
                               config={"recursion_limit": 16})
         return {"scan": _last_ai_text(r)}
 
     @traceable(name="deep-hypothesize", run_type="chain")
     def hypothesize_node(state: DeepAgentState) -> dict:
-        msg = (f"[SCAN 단계 결과]\n{state.get('scan', '(없음)')}\n\n"
-               "위 정보를 바탕으로 각 의심 시점을 inspect/match해 가설을 세우세요. "
-               f"inspect_moment는 {max_inspect}회 한도.")
+        msg = (f"[NARRATIVE — 영상 전체 흐름]\n{state.get('narrative', '(없음)')}\n\n"
+               f"[SCAN — 의심 시점 + chosen card]\n{state.get('scan', '(없음)')}\n\n"
+               "위 두 정보를 함께 보고 각 의심 시점을 inspect/match해 가설을 세우세요. "
+               "narrative의 effect(예: vanish 트릭)에 부합하는 기법을 우선 고려하고, "
+               f"effect와 모순되는 기법은 후보에서 빼세요. inspect_moment는 {max_inspect}회 한도.")
         r = hyp_agent.invoke({"messages": [("user", msg)]},
                              config={"recursion_limit": 4 * max_inspect + 12})
         return {"hypotheses": _last_ai_text(r)}
 
     @traceable(name="deep-verify", run_type="chain")
     def verify_node(state: DeepAgentState) -> dict:
-        msg = (f"[SCAN]\n{state.get('scan', '(없음)')}\n\n"
+        msg = (f"[NARRATIVE]\n{state.get('narrative', '(없음)')}\n\n"
+               f"[SCAN]\n{state.get('scan', '(없음)')}\n\n"
                f"[HYPOTHESES]\n{state.get('hypotheses', '(없음)')}\n\n"
-               "각 가설을 verify_palm_hypothesis 등으로 검증하세요.")
+               "각 가설을 verify_palm_hypothesis 등으로 검증하세요. narrative beat과 "
+               "어긋나는 가설은 의심하세요(예: vanish 효과인데 가설이 단순 위치 이동이면 반박 후보).")
         r = ver_agent.invoke({"messages": [("user", msg)]},
                              config={"recursion_limit": 24})
         return {"verifications": _last_ai_text(r)}
 
     @traceable(name="deep-revise", run_type="chain")
     def revise_node(state: DeepAgentState) -> dict:
-        msg = (f"[HYPOTHESES]\n{state.get('hypotheses', '(없음)')}\n\n"
+        msg = (f"[NARRATIVE]\n{state.get('narrative', '(없음)')}\n\n"
+               f"[HYPOTHESES]\n{state.get('hypotheses', '(없음)')}\n\n"
                f"[VERIFICATIONS]\n{state.get('verifications', '(없음)')}\n\n"
-               "반박된 가설은 철회·수정하고, 지지된 가설은 강화한 최종 가설 목록을 정리하세요.")
+               "반박된 가설은 철회·수정하고, narrative effect 및 verify 결과 모두에 "
+               "부합하는 가설은 강화한 최종 가설 목록을 정리하세요.")
         r = rev_agent.invoke({"messages": [("user", msg)]},
                              config={"recursion_limit": 4})
         return {"revised": _last_ai_text(r)}
 
     @traceable(name="deep-conclude", run_type="chain")
     def conclude_node(state: DeepAgentState) -> dict:
-        msg = (f"[SCAN]\n{state.get('scan', '(없음)')}\n\n"
-               f"[REVISED HYPOTHESES]\n{state.get('revised', '(없음)')}\n\n"
-               "위 가설들에서 최종 채택된 기법마다 explain_technique을 호출한 뒤 "
-               "전체 트릭 추정을 자세히 한국어로 작성하세요.")
+        msg = (f"[NARRATIVE — 큰 흐름]\n{state.get('narrative', '(없음)')}\n\n"
+               f"[SCAN — 세부 데이터]\n{state.get('scan', '(없음)')}\n\n"
+               f"[REVISED HYPOTHESES — 정제된 가설]\n{state.get('revised', '(없음)')}\n\n"
+               "narrative 구조(selection → control → vanish → reveal 등)에 맞춰 "
+               "각 beat에 어떤 기법이 들어갔는지 일관된 스토리로 작성하세요. "
+               "최종 채택된 기법마다 explain_technique을 호출해 작동 원리와 참고 "
+               "영상을 확보한 뒤 전체 트릭 추정을 자세히 한국어로 작성하세요.")
         r = conc_agent.invoke({"messages": [("user", msg)]},
                               config={"recursion_limit": 16})
         return {"conclusion": _last_ai_text(r)}
 
     # ----- 그래프 조립 -----
     g = StateGraph(DeepAgentState)
+    g.add_node("NARRATIVE", narrative_node)
     g.add_node("SCAN", scan_node)
     g.add_node("HYPOTHESIZE", hypothesize_node)
     g.add_node("VERIFY", verify_node)
     g.add_node("REVISE", revise_node)
     g.add_node("CONCLUDE", conclude_node)
-    g.add_edge(START, "SCAN")
+    g.add_edge(START, "NARRATIVE")
+    g.add_edge("NARRATIVE", "SCAN")
     g.add_edge("SCAN", "HYPOTHESIZE")
     g.add_edge("HYPOTHESIZE", "VERIFY")
     g.add_edge("VERIFY", "REVISE")
@@ -563,6 +653,7 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         "matches": scratch.matches,
         # 디버그/추적용 단계별 출력
         "deep_stages": {
+            "narrative": final_state.get("narrative", ""),
             "scan": final_state.get("scan", ""),
             "hypotheses": final_state.get("hypotheses", ""),
             "verifications": final_state.get("verifications", ""),
