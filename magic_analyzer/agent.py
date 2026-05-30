@@ -371,6 +371,86 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         return (f"{cid}: {after_time_sec:.2f}s 이후 다음 등장은 "
                 f"{_fmt_app(nxt)} (gap {gap:.2f}s).")
 
+    # ----- Phase 4: 명명된 트릭 카탈로그 도구 (tricks.py 기반) -----
+    from . import tricks as _tricks_mod
+
+    @tool
+    def list_candidate_tricks(effect: str | None = None) -> str:
+        """알려진 카드 트릭 목록을 effect 카테고리로 필터링해 반환.
+
+        effect 카테고리: coincidence(우연 일치) / transformation(변화) /
+        transposition(위치 교환) / prediction(예측) / ambitious(반복 상승) /
+        production(등장) / vanish(사라짐) / restoration(복원) / revelation(드러남)
+        / mental(심리). None이면 전체.
+
+        이 도구로 NARRATIVE의 effect와 부합하는 트릭 후보를 좁힌 뒤,
+        describe_trick으로 각 후보의 expected beats를 확인하세요.
+        """
+        items = _tricks_mod.by_effect(effect)
+        if not items:
+            avail = ", ".join(_tricks_mod.all_effects())
+            return f"effect='{effect}'에 해당하는 트릭 없음. 사용 가능: {avail}"
+        lines = [f"=== effect={'전체' if not effect else effect}: {len(items)}개 ==="]
+        for t in items:
+            lines.append(f"  · {t['en']} ({t['ko']}) — {t['desc'][:80]}...")
+        return "\n".join(lines)
+
+    @tool
+    def describe_trick(trick_name: str) -> str:
+        """특정 트릭의 expected beats(시간순)와 사용 기법, 시각 단서를 반환.
+
+        agent는 이 도구로 '만약 이 트릭이라면 이런 beat이 보여야 한다'를 확인한 뒤
+        실제 NARRATIVE/SCAN의 관측 beat과 비교해 가설을 검증.
+        """
+        e = _tricks_mod.lookup(trick_name)
+        if not e:
+            return f"'{trick_name}' 트릭을 카탈로그에서 찾지 못함. list_candidate_tricks로 확인."
+        lines = [
+            f"=== {e['en']} ({e['ko']}) | effect={e['effect']} ===",
+            f"설명: {e['desc']}",
+            "",
+            "**Expected beats (이 트릭이라면 보여야 할 시간순 흐름):**",
+        ]
+        for kind, what in e["beats"]:
+            lines.append(f"  - {kind}: {what}")
+        lines.append("")
+        lines.append(f"**사용 기법**: {', '.join(e['techniques'])}")
+        lines.append(f"**시각 단서**: ")
+        for cue in e["visual_cues"]:
+            lines.append(f"  · {cue}")
+        return "\n".join(lines)
+
+    @tool
+    def score_trick_match(trick_name: str, observed_beats: str) -> str:
+        """이 트릭의 expected beats가 관측된 beat 흐름과 얼마나 부합하는지 분석.
+
+        observed_beats: NARRATIVE 단계에서 추출한 beat 리스트(원문 그대로 넘기면 됨).
+        반환: expected vs observed beat 매칭 + 일치/불일치 항목 정리.
+        실제 점수 산정은 LLM이 응답으로 판단하도록 데이터만 제공.
+        """
+        e = _tricks_mod.lookup(trick_name)
+        if not e:
+            return f"'{trick_name}' 트릭 없음."
+        lines = [
+            f"=== {e['en']} 매칭 분석 ===",
+            f"effect: {e['effect']}",
+            "",
+            "**이 트릭이라면 보여야 할 beat (expected):**",
+        ]
+        for kind, what in e["beats"]:
+            lines.append(f"  □ {kind}: {what}")
+        lines.append("")
+        lines.append("**실제 관측 beat (observed, NARRATIVE에서):**")
+        for line in observed_beats.split("\n"):
+            line = line.strip()
+            if line:
+                lines.append(f"  ▷ {line}")
+        lines.append("")
+        lines.append("위 expected vs observed를 비교해 일치/불일치를 판단하세요. "
+                     "expected의 핵심 beat(setup/control/reveal 등)이 observed에 있는지가 관건. "
+                     f"이 트릭의 시각 단서가 영상에 보이는지도 점검: {'; '.join(e['visual_cues'])}")
+        return "\n".join(lines)
+
     @tool
     def verify_palm_hypothesis(time_sec: float, card_id: str | None = None) -> str:
         """특정 의심 시점에서 '카드가 팜/은닉됐다'는 가설을 데이터로 검증.
@@ -427,6 +507,27 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         "이 영상의 전체 narrative arc를 추론합니다. 특정 기법을 단정하지 말고, "
         "큰 흐름과 효과(effect)에 집중하세요. 후속 단계에서 세부 분석이 이어집니다."
     )
+    TRICK_HYPOTHESIS_PROMPT = (
+        "당신은 명명된 카드 트릭 카탈로그를 보고 후보를 좁히는 분석가입니다.\n\n"
+        "**핵심 원칙: NARRATIVE의 effect 추정을 의심하라.**\n"
+        "NARRATIVE가 'transformation'으로 본 게 사실 'coincidence'(미리 깔린 카드와 "
+        "선택 카드 일치)일 수 있음. 시각만으론 구별 불가능한 경우 많음.\n\n"
+        "흐름:\n"
+        "1) NARRATIVE의 effect 후보들로 list_candidate_tricks(effect) 호출(여러 번, "
+        "후보마다). 추가로 list_candidate_tricks() (effect=None)로 전체 카탈로그도 훑어 "
+        "놓치는 후보 없는지 확인.\n"
+        "2) 후보 트릭 4~6개에 대해 describe_trick(name)으로 expected beats + 시각 단서 확인.\n"
+        "3) 각 후보에 score_trick_match(name, observed_beats)로 NARRATIVE의 관측 beat과 "
+        "시각 단서를 비교.\n"
+        "4) **시각 단서 매칭이 핵심**: NARRATIVE에 '한 카드만 백 색 다름' 같은 단서가 "
+        "있으면 Red Hot Mama / Color Changing Deck 둘 다 후보, 어느 게 더 부합하는지 "
+        "분기 검토.\n"
+        "5) 가장 부합하는 트릭 1~3개를 ranked 가설로 출력.\n\n"
+        "**중요**: 분기 사고를 명시. '만약 X 트릭이라면 [setup/control/reveal 등]이 "
+        "관찰돼야 하는데 실제로는 [...]이 보이므로 부합/불부합' 형식.\n\n"
+        "출력: '후보 1: X — 매칭 점수/근거 (시각 단서 부합 항목) | 후보 2: Y — ...' 등. "
+        "단일 단정 X, ranked 후보 남기세요 — 후속 단계가 정함."
+    )
     # 영상 총 길이를 비디오 메타에서 정확히 얻기 — segments에는 reveal 부근까지
     # 모두 포함된다는 보장이 없음.
     _cap = cv2.VideoCapture(str(video_path))
@@ -479,6 +580,10 @@ def analyze(video_path: str, fps: float, segments: list[dict],
     def _llm():
         return ChatOpenAI(model=model, max_tokens=AGENT_MAX_TOKENS)
 
+    trick_hyp_agent = create_react_agent(
+        _llm(),
+        [list_candidate_tricks, describe_trick, score_trick_match],
+        prompt=TRICK_HYPOTHESIS_PROMPT)
     scan_agent = create_react_agent(
         _llm(), [list_suspect_moments, track_chosen_card], prompt=SCAN_PROMPT)
     hyp_agent = create_react_agent(
@@ -494,6 +599,7 @@ def analyze(video_path: str, fps: float, segments: list[dict],
     # ----- State 정의 -----
     class DeepAgentState(TypedDict, total=False):
         narrative: str
+        trick_candidates: str
         scan: str
         hypotheses: str
         verifications: str
@@ -541,18 +647,23 @@ def analyze(video_path: str, fps: float, segments: list[dict],
             f"이 {mode_ko} 영상의 균등 샘플 {len(frames_at)}프레임 (시각순). "
             f"영상 길이 약 {duration_sec:.1f}초.{audio_ctx}\n\n"
             "다음을 구조화한 한국어 narrative로 답하세요:\n\n"
-            "**Effect (트릭 효과)**: vanish / production / transposition / "
-            "transformation / prediction / ambitious / restoration 중 가장 가까운 "
-            "카테고리 + 한 줄 설명\n\n"
+            "**Effect 후보 (1순위·2순위)**: 단일 단정 X, 2~3개 후보로 제시. "
+            "카테고리: vanish / production / transposition / transformation / "
+            "prediction / ambitious / coincidence / restoration / revelation / "
+            "sympathy. **중요**: '색 다른 카드가 보임' 같은 시각 단서는 "
+            "transformation(카드가 변함)일 수도 있지만 coincidence(원래 미리 깔린 "
+            "다른 색 카드)일 수도 있음 — 양쪽 모두 후보로 남기세요. 시각만으로 "
+            "구별 어려운 경우 두 후보 모두 명시.\n\n"
             "**Narrative beats**: 영상 흐름의 핵심 사건들 (시각순). 형식 "
             "'@<시각>: <사건>'. 가능한 beat 카테고리:\n"
-            "  - setup (덱·도구 보여주기)\n"
+            "  - setup (덱·도구 보여주기 — gimmick 미리 깔기 가능)\n"
             "  - selection (관객이 카드/물건 선택)\n"
             "  - control/manipulation (마술사 비밀 조작)\n"
             "  - vanish/transform 등 핵심 변화\n"
             "  - reveal (결과 공개)\n\n"
-            "**추정 기법 카테고리**: 각 beat에 어떤 종류의 기법이 들어갈 만한지 "
-            "(구체 기법명을 단정하지 말 것).\n\n"
+            "**시각 단서**: 영상에서 직접 관찰된 특이 요소 (예: '한 카드만 백 색이 "
+            "다름', '두 카드 사이에 다른 카드 끼어 있음', '카드 4장만 별도 사용' 등). "
+            "이 단서가 트릭 식별에 결정적이므로 자세히.\n\n"
             "특정 시점의 미세 동작은 무시. 큰 흐름·효과가 무엇인지가 목표."
         )}]
         for t, fr in frames_at:
@@ -566,13 +677,25 @@ def analyze(video_path: str, fps: float, segments: list[dict],
                               HumanMessage(content=content)])
         return {"narrative": (resp.content or "").strip()}
 
+    @traceable(name="deep-trick-hypothesis", run_type="chain")
+    def trick_hypothesis_node(state: DeepAgentState) -> dict:
+        """NARRATIVE의 effect + beats를 보고 명명된 트릭 카탈로그에서 후보 검색·분기 비교."""
+        msg = (f"[NARRATIVE — 영상 전체 흐름]\n{state.get('narrative', '(없음)')}\n\n"
+               "위 narrative의 effect를 list_candidate_tricks로 검색해 후보를 좁히고, "
+               "각 후보에 describe_trick + score_trick_match로 expected beats vs 실제 "
+               "관측 beats를 분기적으로 비교하세요. 단일 트릭 단정 X, ranked 가설을 출력.")
+        r = trick_hyp_agent.invoke({"messages": [("user", msg)]},
+                                   config={"recursion_limit": 20})
+        return {"trick_candidates": _last_ai_text(r)}
+
     @traceable(name="deep-scan", run_type="chain")
     def scan_node(state: DeepAgentState) -> dict:
         msg = (f"[NARRATIVE 단계 결과 — 영상 전체 흐름]\n"
                f"{state.get('narrative', '(없음)')}\n\n"
-               f"위 narrative를 참고하면서 이 {mode_ko} 영상의 의심 시점과 chosen "
+               f"[TRICK 후보 가설]\n{state.get('trick_candidates', '(없음)')}\n\n"
+               f"위 두 정보를 참고하면서 이 {mode_ko} 영상의 의심 시점과 chosen "
                "card를 파악하세요. 두 도구를 모두 호출한 뒤 결과를 정리해 보고하세요. "
-               "narrative에 명시된 beat 시각과 의심 시점이 겹치면 그걸 메모.")
+               "narrative beat 시각·trick 후보의 expected beat과 의심 시점이 겹치면 메모.")
         r = scan_agent.invoke({"messages": [("user", msg)]},
                               config={"recursion_limit": 16})
         return {"scan": _last_ai_text(r)}
@@ -580,10 +703,12 @@ def analyze(video_path: str, fps: float, segments: list[dict],
     @traceable(name="deep-hypothesize", run_type="chain")
     def hypothesize_node(state: DeepAgentState) -> dict:
         msg = (f"[NARRATIVE — 영상 전체 흐름]\n{state.get('narrative', '(없음)')}\n\n"
+               f"[TRICK 후보]\n{state.get('trick_candidates', '(없음)')}\n\n"
                f"[SCAN — 의심 시점 + chosen card]\n{state.get('scan', '(없음)')}\n\n"
-               "위 두 정보를 함께 보고 각 의심 시점을 inspect/match해 가설을 세우세요. "
-               "narrative의 effect(예: vanish 트릭)에 부합하는 기법을 우선 고려하고, "
-               f"effect와 모순되는 기법은 후보에서 빼세요. inspect_moment는 {max_inspect}회 한도.")
+               "위 정보를 함께 보고 각 의심 시점을 inspect/match해 가설을 세우세요. "
+               "TRICK 후보의 expected 기법(예: Red Hot Mama → double_lift/force)에 "
+               "부합하는 기법을 우선 고려하세요. trick 후보와 모순되는 기법은 후보에서 "
+               f"빼세요. inspect_moment는 {max_inspect}회 한도.")
         r = hyp_agent.invoke({"messages": [("user", msg)]},
                              config={"recursion_limit": 4 * max_inspect + 12})
         return {"hypotheses": _last_ai_text(r)}
@@ -613,26 +738,37 @@ def analyze(video_path: str, fps: float, segments: list[dict],
     @traceable(name="deep-conclude", run_type="chain")
     def conclude_node(state: DeepAgentState) -> dict:
         msg = (f"[NARRATIVE — 큰 흐름]\n{state.get('narrative', '(없음)')}\n\n"
+               f"[TRICK 후보]\n{state.get('trick_candidates', '(없음)')}\n\n"
                f"[SCAN — 세부 데이터]\n{state.get('scan', '(없음)')}\n\n"
                f"[REVISED HYPOTHESES — 정제된 가설]\n{state.get('revised', '(없음)')}\n\n"
-               "narrative 구조(selection → control → vanish → reveal 등)에 맞춰 "
-               "각 beat에 어떤 기법이 들어갔는지 일관된 스토리로 작성하세요. "
-               "최종 채택된 기법마다 explain_technique을 호출해 작동 원리와 참고 "
-               "영상을 확보한 뒤 전체 트릭 추정을 자세히 한국어로 작성하세요.")
+               "**최종 결론 작성 규칙**:\n"
+               "1) TRICK 후보 1순위가 narrative+가설과 부합하면 그 트릭 이름으로 결론 시작 "
+               "(예: '이 트릭은 Red Hot Mama입니다').\n"
+               "2) 그 트릭의 expected beats를 영상의 실제 시각과 매핑해 설명.\n"
+               "3) 채택 기법마다 explain_technique 호출해 작동 원리·참고 영상 확보.\n"
+               "4) TRICK 후보 2순위/철회된 가설도 짧게 언급 ('처음엔 Ambitious Card 의심했으나 "
+               "X 이유로 철회').\n"
+               "5) 한국어, 자세히.")
         r = conc_agent.invoke({"messages": [("user", msg)]},
                               config={"recursion_limit": 16})
         return {"conclusion": _last_ai_text(r)}
 
     # ----- 그래프 조립 -----
+    # NARRATIVE → TRICK_HYPOTHESIS → SCAN → HYPOTHESIZE → VERIFY → REVISE → CONCLUDE
+    # TRICK_HYPOTHESIS 노드가 명명된 트릭 카탈로그에서 분기 검증으로 후보를
+    # 좁혀 후속 단계들이 일반 카테고리(transformation/coincidence)가 아니라
+    # 구체 트릭명(Red Hot Mama / Ambitious Card 등)으로 결론에 도달하게 함.
     g = StateGraph(DeepAgentState)
     g.add_node("NARRATIVE", narrative_node)
+    g.add_node("TRICK_HYPOTHESIS", trick_hypothesis_node)
     g.add_node("SCAN", scan_node)
     g.add_node("HYPOTHESIZE", hypothesize_node)
     g.add_node("VERIFY", verify_node)
     g.add_node("REVISE", revise_node)
     g.add_node("CONCLUDE", conclude_node)
     g.add_edge(START, "NARRATIVE")
-    g.add_edge("NARRATIVE", "SCAN")
+    g.add_edge("NARRATIVE", "TRICK_HYPOTHESIS")
+    g.add_edge("TRICK_HYPOTHESIS", "SCAN")
     g.add_edge("SCAN", "HYPOTHESIZE")
     g.add_edge("HYPOTHESIZE", "VERIFY")
     g.add_edge("VERIFY", "REVISE")
@@ -654,6 +790,7 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         # 디버그/추적용 단계별 출력
         "deep_stages": {
             "narrative": final_state.get("narrative", ""),
+            "trick_candidates": final_state.get("trick_candidates", ""),
             "scan": final_state.get("scan", ""),
             "hypotheses": final_state.get("hypotheses", ""),
             "verifications": final_state.get("verifications", ""),
