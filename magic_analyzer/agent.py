@@ -49,19 +49,34 @@ class AgentScratch:
 
 AGENT_SYSTEM = (
     "당신은 클로즈업 마술(카드·동전)의 기법을 분석하는 전문가 에이전트입니다. "
-    "교육·복기 목적으로 한 영상의 '비밀 동작'을 추론하고 '기법 자체를 자세히 설명'합니다.\n"
-    "진행 방법:\n"
-    "1) list_suspect_moments 로 자동 탐지된 의심 순간을 확인합니다.\n"
-    "2) 의심스러운 순간을 골라 inspect_moment(time_sec)로 들여다봅니다. "
-    "(최대 6곳, 같은 곳 반복 금지.) 또한 match_technique(time_sec)로 '예시 "
-    "라이브러리'와의 데이터 기반 유사도(어떤 기법과 닮았는지)도 확인하세요.\n"
-    "3) 의심되는 기법마다 explain_technique(기법명)을 호출해 정확한 설명과 참고 "
-    "영상 링크를 확보합니다. (예: explain_technique('프렌치 드롭'))\n"
-    "4) 다음을 '자세히' 담은 결론을 한국어로 작성합니다:\n"
+    "교육·복기 목적으로 한 영상의 '비밀 동작'을 추론하고 '기법 자체를 자세히 설명'합니다.\n\n"
+    "**핵심 작업 흐름 — 가설→검증→수정(reflect loop)**\n"
+    "선형으로 의심 순간을 한 번씩만 보는 게 아니라, 가설을 세우고 다른 시점의 "
+    "증거로 검증해 수정하세요.\n\n"
+    "단계:\n"
+    "1) **SCAN** — list_suspect_moments로 의심 순간 목록 확인. "
+    "track_chosen_card로 관객이 고른 카드 후보 + 그 카드의 등장 타임라인 파악.\n"
+    "2) **HYPOTHESIZE per moment** — 각 의심 시점에 대해 inspect_moment(t)로 "
+    "비전 관찰 + match_technique(t)로 데이터 매칭을 보고 가설을 세웁니다. "
+    "예: '클래식 패스로 chosen card를 컨트롤' / '프렌치 드롭으로 카드 vanish' "
+    "/ '단순한 deck cut'.\n"
+    "3) **VERIFY** — 가설을 데이터로 검증:\n"
+    "   - verify_palm_hypothesis(t, card_id): 그 시점에 chosen card가 사라졌는가? "
+    "     영구 사라졌는가(팜 강한 증거) 한참 후 다시 등장(produce 가능)?\n"
+    "   - where_did_card_go(card_id, t): 그 카드가 다음에 언제 등장하는가?\n"
+    "   - card_timeline_for(card_id): 다른 카드 ID의 등장 패턴과 비교.\n"
+    "   - explain_technique(기법명): 그 기법의 작동 원리·관찰 단서가 데이터와 부합하는가?\n"
+    "4) **REVISE** — 검증 결과가 가설을 반박하면(예: '팜됐다 했는데 1초 후 다시 등장') "
+    "가설을 철회/수정하세요. '프렌치 드롭은 동전 기법인데 카드 영상에 출력'처럼 "
+    "type 불일치도 단서.\n"
+    "5) **CONCLUDE** — 최종 결론(한국어, 자세히):\n"
     "   - 이 마술이 무엇을 보여주는 트릭인지\n"
-    "   - 사용된 기법 각각이 '어떻게 작동하는지' (동작 원리)\n"
-    "   - 영상의 어느 순간·어떤 손동작이 그 근거인지 (관찰된 단서)\n"
-    "확신 없으면 단정 말고 가능성으로, 근거 부족하면 '판단 어려움'이라고 하세요."
+    "   - 사용된 각 기법이 '어떻게 작동하는지'\n"
+    "   - 어느 순간·어떤 손동작·어떤 카드 이벤트가 근거인지 (시각·card_id 명시)\n"
+    "   - 검증에서 반박된 가설도 짧게 언급('처음엔 X로 추정했으나 Y 검증에서 철회')\n\n"
+    "사용 한도: inspect_moment 최대 6회. 다른 도구는 자유. 같은 시점 inspect 반복 금지.\n"
+    "원칙: 확신 없으면 단정 말고 가능성으로, 데이터가 모순되면 '판단 어려움'이라고 하세요. "
+    "특히 mode가 'card'면 coin 전용 기법(프렌치 드롭 등)은 후보에서 제외하세요."
 )
 VISION_SYSTEM = (
     "마술 분석용입니다. 연속 프레임(직전→정점→직후)에서 두 손의 위치/모양 변화를 "
@@ -167,7 +182,7 @@ def _snap_to_peak(segments: list[dict], time_sec: float, tol: float = 0.6) -> fl
 @traceable(name="magic-trick-agent", run_type="chain")
 def analyze(video_path: str, fps: float, segments: list[dict],
            mode: str = "card", model: str = "gpt-4o",
-           max_inspect: int = 6) -> dict:
+           max_inspect: int = 6, card_timeline=None) -> dict:
     """비디오 경로 + 탐지된 의심 순간 메타로 ReAct 에이전트를 돌려 분석.
 
     segments: [{peak_sec, score, top_signals}, ...]
@@ -277,16 +292,116 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         return "라이브러리 매칭(유사도 0~1): " + ", ".join(
             f"{r['name_ko']} {r['similarity']:.2f}" for r in res)
 
+    # ----- Phase 2: 가설 검증 도구 (카드 타임라인 기반) -----
+    # 카드 타임라인이 없으면 도구들은 '데이터 없음'으로 응답.
+    def _fmt_app(a) -> str:
+        return f"{a.start_sec:.2f}~{a.end_sec:.2f}s ({a.duration:.2f}s, area={a.max_area:.0f})"
+
+    @tool
+    def track_chosen_card() -> str:
+        """관객이 고른 것으로 추정되는 카드(face-up으로 가장 오래·크게 보인 카드)와
+        그 카드의 전체 등장 타임라인을 반환한다. 가설 검증의 기준점."""
+        if card_timeline is None or not card_timeline.appearances:
+            return "카드 검출 데이터 없음(객체 검출 비활성 또는 카드 face-up 없음)."
+        chosen = card_timeline.chosen_card()
+        if not chosen:
+            return "추정 가능한 chosen card 없음."
+        apps = card_timeline.timeline_for(chosen)
+        total = card_timeline.total_visible(chosen)
+        lines = [f"추정 chosen card = {chosen} (총 face-up 노출 {total:.2f}s, "
+                 f"{len(apps)}회 등장)"]
+        for a in apps:
+            lines.append(f"  · {_fmt_app(a)}")
+        return "\n".join(lines)
+
+    @tool
+    def card_timeline_for(card_id: str) -> str:
+        """특정 카드 ID(예: '10D', 'KH')의 등장 타임라인을 반환한다."""
+        if card_timeline is None:
+            return "카드 검출 데이터 없음."
+        apps = card_timeline.timeline_for(card_id.strip().upper())
+        if not apps:
+            return f"{card_id}: 영상에서 face-up으로 검출된 적 없음."
+        lines = [f"{card_id}: {len(apps)}회 등장, 총 {sum(a.duration for a in apps):.2f}s"]
+        for a in apps:
+            lines.append(f"  · {_fmt_app(a)}")
+        return "\n".join(lines)
+
+    @tool
+    def where_did_card_go(card_id: str, after_time_sec: float) -> str:
+        """특정 카드가 주어진 시각 이후 다음에 face-up으로 등장하는 시점을 반환한다.
+        없으면 '영상 끝까지 다시 안 보임' — 팜/덱 영구 은닉 가설을 강하게 지지."""
+        if card_timeline is None:
+            return "카드 검출 데이터 없음."
+        cid = card_id.strip().upper()
+        nxt = card_timeline.next_after(cid, float(after_time_sec))
+        if nxt is None:
+            return (f"{cid}: {after_time_sec:.2f}s 이후 영상 끝까지 다시 face-up "
+                    f"검출 안 됨(영구 사라짐 — 팜/덱 깊이 가능성).")
+        gap = nxt.start_sec - after_time_sec
+        return (f"{cid}: {after_time_sec:.2f}s 이후 다음 등장은 "
+                f"{_fmt_app(nxt)} (gap {gap:.2f}s).")
+
+    @tool
+    def verify_palm_hypothesis(time_sec: float, card_id: str | None = None) -> str:
+        """특정 의심 시점에서 '카드가 팜/은닉됐다'는 가설을 데이터로 검증.
+
+        card_id를 지정하면 그 카드, 아니면 chosen_card에 대해:
+        - 그 시점 직전엔 보였는가?
+        - 그 시점 직후엔 사라졌는가?
+        - 그 후 영상에서 다시 등장하는가? (재등장은 팜 가설 약화 — 단순 위치 이동)
+        """
+        if card_timeline is None:
+            return "카드 검출 데이터 없음."
+        t = float(time_sec)
+        cid = card_id.strip().upper() if card_id else card_timeline.chosen_card()
+        if not cid:
+            return "검증할 카드 미지정 + chosen card도 없음."
+        apps = card_timeline.timeline_for(cid)
+        if not apps:
+            return f"{cid}: 영상에서 face-up 검출된 적 없어 가설 검증 불가."
+        # 직전 등장(보임)
+        before = [a for a in apps if a.end_sec <= t]
+        # 직후 등장(다시 보임)
+        after = [a for a in apps if a.start_sec >= t]
+        last_before = before[-1] if before else None
+        next_after = after[0] if after else None
+        parts = [f"=== {cid} @ {t:.2f}s 가설 검증 ==="]
+        if last_before:
+            gap_b = t - last_before.end_sec
+            parts.append(f"직전 등장: {_fmt_app(last_before)} (시점까지 {gap_b:.2f}s 전)")
+        else:
+            parts.append("직전 등장: 없음(시점 이전 한 번도 face-up 안 됨)")
+        if next_after:
+            gap_a = next_after.start_sec - t
+            parts.append(f"직후 등장: {_fmt_app(next_after)} (시점에서 {gap_a:.2f}s 후)")
+            if gap_a > 5.0:
+                parts.append("→ 한참 후 다시 등장 = 일시 은닉 후 reveal 가능(팜+나중에 produce).")
+            else:
+                parts.append("→ 짧은 간격 재등장 = 팜보다는 단순 위치 이동/회전 가능성.")
+        else:
+            parts.append("직후 등장: 없음(영상 끝까지 다시 안 보임)")
+            parts.append("→ 영구 사라짐 = 팜/덱 깊이 은닉 강한 증거.")
+        return "\n".join(parts)
+
+    tools = [list_suspect_moments, inspect_moment, explain_technique,
+             match_technique, track_chosen_card, card_timeline_for,
+             where_did_card_go, verify_palm_hypothesis]
+
     agent = create_react_agent(
         ChatOpenAI(model=model, max_tokens=AGENT_MAX_TOKENS),
-        [list_suspect_moments, inspect_moment, explain_technique, match_technique],
+        tools,
         prompt=AGENT_SYSTEM,
     )
     task = (f"이 {MODE_KO.get(mode, mode)} 영상의 비밀 기법을 분석하세요. "
-            f"list_suspect_moments로 의심 순간을 확인하고, 의심스러운 곳을 "
-            f"inspect_moment로 들여다본 뒤 전체 트릭과 핵심 비밀 동작을 종합 결론으로 쓰세요.")
+            f"SCAN→HYPOTHESIZE→VERIFY→REVISE→CONCLUDE 흐름을 따르세요. "
+            f"먼저 list_suspect_moments + track_chosen_card로 전체 그림을 파악한 뒤, "
+            f"의심 시점마다 inspect_moment/match_technique로 가설을 세우고, "
+            f"verify_palm_hypothesis/where_did_card_go로 그 가설을 다른 시점 데이터로 "
+            f"검증하세요. 가설이 반박되면 수정한 뒤 최종 결론을 작성하세요.")
+    # reflect 루프가 도구를 더 많이 호출하므로 recursion_limit을 넉넉히.
     result = agent.invoke({"messages": [("user", task)]},
-                          config={"recursion_limit": 4 * max_inspect + 16})
+                          config={"recursion_limit": 8 * max_inspect + 24})
 
     summary = ""
     for m in reversed(result["messages"]):

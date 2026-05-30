@@ -27,8 +27,9 @@ class ObjectObs:
     """한 프레임의 객체 검출 관측."""
     frame_idx: int
     time_sec: float
-    cards: list[tuple[float, float, float, float, float]]  # [(x1,y1,x2,y2,conf), ...]
-    coins: list[tuple[float, float, float, float]]         # [(cx,cy,radius,strength), ...]
+    # 카드: (x1, y1, x2, y2, conf, card_id) — card_id는 "10D"/"KH"/... 52-class 라벨
+    cards: list[tuple[float, float, float, float, float, str]]
+    coins: list[tuple[float, float, float, float]]  # [(cx,cy,radius,strength), ...]
 
     @property
     def n_cards(self) -> int:
@@ -43,7 +44,12 @@ class ObjectObs:
         """가장 큰 카드의 면적(픽셀^2). 카드 없음 = 0."""
         if not self.cards:
             return 0.0
-        return max((x2 - x1) * (y2 - y1) for (x1, y1, x2, y2, _) in self.cards)
+        return max((c[2] - c[0]) * (c[3] - c[1]) for c in self.cards)
+
+    @property
+    def card_ids(self) -> list[str]:
+        """이 프레임에서 검출된 카드 ID 목록 (예: ['10D', 'KH'])."""
+        return [c[5] for c in self.cards]
 
 
 # ---------- 카드 검출(YOLO) ----------
@@ -75,7 +81,11 @@ def _get_card_model():
 
 
 def detect_cards(image_bgr: np.ndarray, conf: float = 0.25) -> list:
-    """이미지 한 장에서 카드 bbox + confidence 리스트 반환. 모델 없으면 빈 리스트."""
+    """이미지 한 장에서 카드 bbox + confidence + card_id 리스트 반환.
+
+    반환: [(x1, y1, x2, y2, conf, card_id), ...] — card_id는 52-class 라벨("10D" 등).
+    모델 없으면 빈 리스트.
+    """
     model = _get_card_model()
     if not model:
         return []
@@ -84,7 +94,9 @@ def detect_cards(image_bgr: np.ndarray, conf: float = 0.25) -> list:
     for b in results[0].boxes:
         xyxy = b.xyxy[0].cpu().numpy().tolist()
         c = float(b.conf[0])
-        out.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3], c))
+        cls = int(b.cls[0])
+        card_id = model.names[cls]
+        out.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3], c, card_id))
     return out
 
 
@@ -127,3 +139,135 @@ def warmup() -> bool:
     """파이프라인 시작 전 모델 다운로드/로드를 미리 트리거. True = 카드 모델 사용 가능."""
     m = _get_card_model()
     return bool(m)
+
+
+# ---------- 카드 타임라인 (per-card tracking over time) ----------
+@dataclass
+class CardAppearance:
+    """한 카드 ID가 연속적으로 보인 한 구간."""
+    card_id: str        # "10D", "KH" 등
+    start_sec: float
+    end_sec: float
+    max_area: float     # 이 구간 동안 가장 컸던 bbox 면적
+    n_frames: int       # 이 구간에서 검출된 프레임 수
+
+    @property
+    def duration(self) -> float:
+        return self.end_sec - self.start_sec
+
+
+class CardTimeline:
+    """영상 전체의 per-card 등장 타임라인 + 쿼리.
+
+    의도:
+      - "관객이 고른 카드"를 추적: chosen_card()
+      - 카드별 등장/소실 이력으로 가설 검증("이 카드가 그 후에 다시 보였나?")
+      - YOLO가 못 보는 시점(덱·팜)에 대해 '있다 → 없다 → 영영 없다' 같은
+        가설을 데이터로 뒷받침
+    """
+
+    def __init__(self, appearances: list[CardAppearance], duration_sec: float):
+        self.appearances = sorted(appearances, key=lambda a: a.start_sec)
+        self.duration_sec = duration_sec
+
+    @property
+    def card_ids(self) -> list[str]:
+        """검출된 unique 카드 ID 목록."""
+        seen = set()
+        out = []
+        for a in self.appearances:
+            if a.card_id not in seen:
+                seen.add(a.card_id)
+                out.append(a.card_id)
+        return out
+
+    def timeline_for(self, card_id: str) -> list[CardAppearance]:
+        """특정 카드의 모든 등장 구간."""
+        return [a for a in self.appearances if a.card_id == card_id]
+
+    def total_visible(self, card_id: str) -> float:
+        """이 카드의 총 화면 노출 시간(초)."""
+        return sum(a.duration for a in self.timeline_for(card_id))
+
+    def max_area_for(self, card_id: str) -> float:
+        apps = self.timeline_for(card_id)
+        return max((a.max_area for a in apps), default=0.0)
+
+    def chosen_card(self) -> str | None:
+        """관객 카드 휴리스틱: 총 노출 시간 × 최대 면적이 가장 큰 카드.
+
+        '관객이 골랐다 = 마술사가 카메라로 길게/크게 보여준다' 가정.
+        후보 없으면 None.
+        """
+        if not self.appearances:
+            return None
+        scored = [
+            (cid, self.total_visible(cid) * (self.max_area_for(cid) ** 0.5))
+            for cid in self.card_ids
+        ]
+        scored.sort(key=lambda x: -x[1])
+        return scored[0][0] if scored else None
+
+    def next_after(self, card_id: str, time_sec: float) -> CardAppearance | None:
+        """time_sec 이후 이 카드가 다음에 등장하는 구간(없으면 None)."""
+        for a in self.timeline_for(card_id):
+            if a.start_sec >= time_sec:
+                return a
+        return None
+
+    def visible_at(self, time_sec: float) -> list[str]:
+        """time_sec 시점에 화면에 보이는 카드 ID 목록."""
+        return [a.card_id for a in self.appearances
+                if a.start_sec <= time_sec <= a.end_sec]
+
+    def disappeared_around(self, time_sec: float, window: float = 1.0) -> list[str]:
+        """time_sec 직전엔 보였지만 직후엔 안 보이는 카드들 ('사라짐' 후보)."""
+        before = set()
+        after = set()
+        for a in self.appearances:
+            if a.start_sec <= time_sec - 0.01 and a.end_sec >= time_sec - window:
+                before.add(a.card_id)
+            if a.end_sec >= time_sec + 0.01 and a.start_sec <= time_sec + window:
+                after.add(a.card_id)
+        return sorted(before - after)
+
+
+def build_card_timeline(objects_list: list, duration_sec: float,
+                        gap_tolerance_sec: float = 0.3) -> CardTimeline:
+    """프레임별 ObjectObs 리스트 → CardTimeline.
+
+    같은 카드 ID의 연속 검출을 한 등장 구간으로 묶는다. 짧은 검출 누락
+    (`gap_tolerance_sec` 이하)은 같은 구간으로 본다(YOLO가 한두 프레임
+    놓치는 건 무시).
+    """
+    # card_id → [(time_sec, area), ...] (정렬됨)
+    per_card: dict[str, list[tuple[float, float]]] = {}
+    for obs in objects_list:
+        if obs is None:
+            continue
+        for c in obs.cards:
+            x1, y1, x2, y2 = c[0], c[1], c[2], c[3]
+            card_id = c[5]
+            area = (x2 - x1) * (y2 - y1)
+            per_card.setdefault(card_id, []).append((obs.time_sec, area))
+
+    appearances: list[CardAppearance] = []
+    for card_id, samples in per_card.items():
+        samples.sort()
+        cur_start = samples[0][0]
+        cur_end = samples[0][0]
+        cur_max = samples[0][1]
+        cur_n = 1
+        for t, a in samples[1:]:
+            if t - cur_end <= gap_tolerance_sec:
+                cur_end = t
+                cur_max = max(cur_max, a)
+                cur_n += 1
+            else:
+                appearances.append(CardAppearance(card_id, cur_start, cur_end,
+                                                  cur_max, cur_n))
+                cur_start, cur_end, cur_max, cur_n = t, t, a, 1
+        appearances.append(CardAppearance(card_id, cur_start, cur_end,
+                                          cur_max, cur_n))
+
+    return CardTimeline(appearances=appearances, duration_sec=duration_sec)

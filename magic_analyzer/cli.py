@@ -119,7 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[1/3] 손 추적 + 객체 검출 중... ({video_path.name}, mode={args.mode})")
     # 객체 검출 모델 미리 로드(첫 호출의 다운로드/초기화 비용을 진행률 메시지 전에).
     try:
-        from .objects import warmup as obj_warmup, detect_objects
+        from .objects import (warmup as obj_warmup, detect_objects,  # noqa: F401
+                              build_card_timeline)
         obj_ready = obj_warmup()
         if obj_ready:
             print("      객체 검출 모델 준비 완료")
@@ -128,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:
         obj_ready = False
         detect_objects = None  # type: ignore
+        build_card_timeline = None  # type: ignore
         print(f"      객체 검출 비활성: {e}")
     # YOLO 추론은 프레임당 ~30ms라 매 프레임 돌리면 분 단위 추가됨. 신호는 전이
     # 검출이라 stride=3(약 0.125s)에서도 vanish/appear를 충분히 잡는다.
@@ -213,7 +215,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- 4단계: 도구 호출 에이전트 분석 (옵션) ---
     if llm_segs:
-        _run_agent(llm_segs, video_path, meta.fps, args, out_dir)
+        # 카드 타임라인은 객체 검출이 활성화된 경우에만 구축(에이전트 검증 도구에 전달)
+        card_tl = None
+        if obj_ready and build_card_timeline is not None:
+            card_tl = build_card_timeline(objects, meta.duration_sec)
+            chosen = card_tl.chosen_card()
+            if chosen:
+                print(f"      [카드 타임라인] {len(card_tl.card_ids)}개 카드, "
+                      f"추정 chosen card = {chosen}")
+        _run_agent(llm_segs, video_path, meta.fps, args, out_dir,
+                   card_timeline=card_tl)
 
     print(f"\n완료. 결과 폴더: {out_dir.resolve()}")
     return 0
@@ -224,7 +235,8 @@ def _fmt_ts(t: float) -> str:
     return f"{int(m):02d}:{s:05.2f}"
 
 
-def _run_agent(llm_segs, video_path, fps, args, out_dir: Path) -> None:
+def _run_agent(llm_segs, video_path, fps, args, out_dir: Path,
+               card_timeline=None) -> None:
     """도구 호출 에이전트(ReAct, OpenAI 비전 도구 + LangSmith 추적)로 분석."""
     print(f"[4/4] 도구 호출 에이전트 분석 중... ({args.llm_model}, "
           f"의심 {len(llm_segs)}개 — 에이전트가 직접 inspect)")
@@ -234,7 +246,8 @@ def _run_agent(llm_segs, video_path, fps, args, out_dir: Path) -> None:
     try:
         from .agent import analyze
         result = analyze(str(video_path), fps, seg_metas,
-                         mode=args.mode, model=args.llm_model, max_inspect=args.llm_top)
+                         mode=args.mode, model=args.llm_model,
+                         max_inspect=args.llm_top, card_timeline=card_timeline)
     except Exception as e:
         print(f"      [오류] 에이전트 실행 실패: {e}", file=sys.stderr)
         print("      OPENAI_API_KEY를 설정했는지 확인하세요.", file=sys.stderr)
