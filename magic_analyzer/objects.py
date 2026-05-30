@@ -220,6 +220,26 @@ class CardTimeline:
         return [a.card_id for a in self.appearances
                 if a.start_sec <= time_sec <= a.end_sec]
 
+    def prominence_events(self, min_duration: float = 0.4,
+                          min_area: float = 600.0) -> list["CardEvent"]:
+        """카드가 prominent하게 보인 이벤트들(시간순). selection·reveal 후보.
+
+        한 등장 구간이 `min_duration`초 이상 지속되고 `min_area` 이상 면적이면
+        prominent로 간주. min_area=600은 360p 영상 기준 카드 한 장이 화면에
+        뚜렷이 보이는 기준선(실측치).
+        """
+        events: list[CardEvent] = []
+        for a in self.appearances:
+            if a.duration < min_duration or a.max_area < min_area:
+                continue
+            mid = (a.start_sec + a.end_sec) / 2
+            score = a.duration * (a.max_area ** 0.5)
+            events.append(CardEvent(card_id=a.card_id, time_sec=mid,
+                                    duration=a.duration, max_area=a.max_area,
+                                    score=score))
+        events.sort(key=lambda e: e.time_sec)
+        return events
+
     def disappeared_around(self, time_sec: float, window: float = 1.0) -> list[str]:
         """time_sec 직전엔 보였지만 직후엔 안 보이는 카드들 ('사라짐' 후보)."""
         before = set()
@@ -230,6 +250,20 @@ class CardTimeline:
             if a.end_sec >= time_sec + 0.01 and a.start_sec <= time_sec + window:
                 after.add(a.card_id)
         return sorted(before - after)
+
+
+@dataclass
+class CardEvent:
+    """카드가 카메라에 prominent하게 보인 한 이벤트(selection/reveal 후보).
+
+    'prominent' = 일정 시간(sustained) 동안 큰 면적으로 face-up 노출.
+    영상 진행 순서로 첫 prominent 이벤트 = 선택 후보, 마지막 = reveal 후보.
+    """
+    card_id: str
+    time_sec: float       # 이 이벤트의 중심 시각
+    duration: float       # 지속 시간
+    max_area: float       # 이 이벤트 동안 최대 bbox 면적
+    score: float          # duration * sqrt(area) — 비교용 점수
 
 
 def build_card_timeline(objects_list: list, duration_sec: float,

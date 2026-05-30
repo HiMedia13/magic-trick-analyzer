@@ -52,8 +52,10 @@ def _openness(lm: np.ndarray) -> float:
 
 
 class HandTracker:
-    def __init__(self, max_hands: int = 2, detection_conf: float = 0.5,
+    def __init__(self, max_hands: int = 4, detection_conf: float = 0.5,
                  tracking_conf: float = 0.5) -> None:
+        # max_hands=4 — 마술사 2손 + 관객 손까지 잡기 위함. MediaPipe는 검출된
+        # 손 수에 비례해 비용이 들기에 2손만 보이면 추가 비용 없음.
         model_path = ensure_hand_model()
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),

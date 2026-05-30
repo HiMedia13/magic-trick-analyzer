@@ -182,7 +182,8 @@ def _snap_to_peak(segments: list[dict], time_sec: float, tol: float = 0.6) -> fl
 @traceable(name="magic-trick-agent", run_type="chain")
 def analyze(video_path: str, fps: float, segments: list[dict],
            mode: str = "card", model: str = "gpt-4o",
-           max_inspect: int = 6, card_timeline=None) -> dict:
+           max_inspect: int = 6, card_timeline=None,
+           chosen_evidence=None) -> dict:
     """비디오 경로 + 탐지된 의심 순간 메타로 ReAct 에이전트를 돌려 분석.
 
     segments: [{peak_sec, score, top_signals}, ...]
@@ -299,8 +300,34 @@ def analyze(video_path: str, fps: float, segments: list[dict],
 
     @tool
     def track_chosen_card() -> str:
-        """관객이 고른 것으로 추정되는 카드(face-up으로 가장 오래·크게 보인 카드)와
-        그 카드의 전체 등장 타임라인을 반환한다. 가설 검증의 기준점."""
+        """관객이 고른 카드를 다중 신호(시각 prominence + 음성 언급 + 관객 손)로
+        식별하고 그 카드의 전체 등장 타임라인을 반환. 가설 검증의 기준점."""
+        # 1순위: chosen_evidence (D 결합)이 있으면 그쪽 정보 사용
+        if chosen_evidence is not None and chosen_evidence.card_id:
+            cid = chosen_evidence.card_id
+            lines = [f"추정 chosen card = {cid} (신뢰도 {chosen_evidence.confidence})",
+                     f"근거: {chosen_evidence.rationale}"]
+            if chosen_evidence.selection_event:
+                e = chosen_evidence.selection_event
+                lines.append(f"  · selection 추정: {e.time_sec:.2f}s (지속 {e.duration:.2f}s)")
+            if chosen_evidence.reveal_event:
+                e = chosen_evidence.reveal_event
+                lines.append(f"  · reveal 추정: {e.time_sec:.2f}s (지속 {e.duration:.2f}s)")
+            if chosen_evidence.audio_mention:
+                m = chosen_evidence.audio_mention
+                lines.append(f"  · 음성 언급 @ {m.time_sec:.2f}s: \"{m.text[:60]}\"")
+            if chosen_evidence.audience_hand_event:
+                h = chosen_evidence.audience_hand_event
+                lines.append(f"  · 관객 손 등장 @ {h.start_sec:.2f}~{h.end_sec:.2f}s "
+                             f"(최대 {h.max_n_hands}손)")
+            if card_timeline:
+                apps = card_timeline.timeline_for(cid)
+                if apps:
+                    lines.append(f"전체 등장 타임라인 ({len(apps)}회):")
+                    for a in apps:
+                        lines.append(f"  · {_fmt_app(a)}")
+            return "\n".join(lines)
+        # 폴백: 단순 휴리스틱
         if card_timeline is None or not card_timeline.appearances:
             return "카드 검출 데이터 없음(객체 검출 비활성 또는 카드 face-up 없음)."
         chosen = card_timeline.chosen_card()

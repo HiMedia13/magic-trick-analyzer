@@ -215,16 +215,32 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- 4단계: 도구 호출 에이전트 분석 (옵션) ---
     if llm_segs:
-        # 카드 타임라인은 객체 검출이 활성화된 경우에만 구축(에이전트 검증 도구에 전달)
+        # 카드 타임라인 + 음성 cue + 관객 손 이벤트 → chosen card 다중신호 식별
         card_tl = None
+        chosen_evidence = None
         if obj_ready and build_card_timeline is not None:
             card_tl = build_card_timeline(objects, meta.duration_sec)
-            chosen = card_tl.chosen_card()
-            if chosen:
-                print(f"      [카드 타임라인] {len(card_tl.card_ids)}개 카드, "
-                      f"추정 chosen card = {chosen}")
+            print(f"      [카드 타임라인] {len(card_tl.card_ids)}개 카드 ID")
+            # 음성 cue 추출(전사 캐시 재사용). 실패해도 시각만으로 식별 진행.
+            try:
+                from .audio_cues import transcribe_and_extract
+                mentions, phrases = transcribe_and_extract(str(video_path))
+                if mentions:
+                    print(f"      [음성 cue] 카드 언급 {len(mentions)}건, "
+                          f"선택 구문 {len(phrases) if phrases else 0}건")
+            except Exception as e:
+                print(f"      [음성 cue 스킵] {e}")
+                mentions, phrases = None, None
+            from .chosen_card import identify_chosen_card
+            chosen_evidence = identify_chosen_card(
+                card_tl, frames=frames, mentions=mentions,
+                selection_phrases=phrases,
+            )
+            print(f"      [Chosen card] {chosen_evidence.card_id} "
+                  f"(신뢰도 {chosen_evidence.confidence}) "
+                  f"— {chosen_evidence.rationale}")
         _run_agent(llm_segs, video_path, meta.fps, args, out_dir,
-                   card_timeline=card_tl)
+                   card_timeline=card_tl, chosen_evidence=chosen_evidence)
 
     print(f"\n완료. 결과 폴더: {out_dir.resolve()}")
     return 0
@@ -236,7 +252,7 @@ def _fmt_ts(t: float) -> str:
 
 
 def _run_agent(llm_segs, video_path, fps, args, out_dir: Path,
-               card_timeline=None) -> None:
+               card_timeline=None, chosen_evidence=None) -> None:
     """도구 호출 에이전트(ReAct, OpenAI 비전 도구 + LangSmith 추적)로 분석."""
     print(f"[4/4] 도구 호출 에이전트 분석 중... ({args.llm_model}, "
           f"의심 {len(llm_segs)}개 — 에이전트가 직접 inspect)")
@@ -247,7 +263,8 @@ def _run_agent(llm_segs, video_path, fps, args, out_dir: Path,
         from .agent import analyze
         result = analyze(str(video_path), fps, seg_metas,
                          mode=args.mode, model=args.llm_model,
-                         max_inspect=args.llm_top, card_timeline=card_timeline)
+                         max_inspect=args.llm_top, card_timeline=card_timeline,
+                         chosen_evidence=chosen_evidence)
     except Exception as e:
         print(f"      [오류] 에이전트 실행 실패: {e}", file=sys.stderr)
         print("      OPENAI_API_KEY를 설정했는지 확인하세요.", file=sys.stderr)
