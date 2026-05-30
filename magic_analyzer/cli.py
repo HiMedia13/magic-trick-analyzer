@@ -306,9 +306,13 @@ def _run_agent(llm_segs, video_path, fps, args, out_dir: Path,
     print(f"\n      [전체 트릭 추정]\n        {summary}")
 
     (out_dir / "llm.txt").write_text("\n".join(lines), encoding="utf-8")
-    write_json(out_dir / "llm.json",
-               {"model": args.llm_model, "summary": summary,
-                "techniques": techniques, "matches": matches, "results": results})
+    payload = {"model": args.llm_model, "summary": summary,
+               "techniques": techniques, "matches": matches, "results": results}
+    # Deep Agent StateGraph 단계별 출력(있을 때만)
+    stages = result.get("deep_stages") if isinstance(result, dict) else None
+    if stages:
+        payload["deep_stages"] = stages
+    write_json(out_dir / "llm.json", payload)
     print(f"      → {out_dir / 'llm.txt'}")
 
 

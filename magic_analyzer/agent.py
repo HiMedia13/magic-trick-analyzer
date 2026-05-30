@@ -18,11 +18,13 @@ from __future__ import annotations
 import base64
 import os
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import cv2
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import create_react_agent
 from langsmith import traceable
 
@@ -411,36 +413,162 @@ def analyze(video_path: str, fps: float, segments: list[dict],
             parts.append("→ 영구 사라짐 = 팜/덱 깊이 은닉 강한 증거.")
         return "\n".join(parts)
 
-    tools = [list_suspect_moments, inspect_moment, explain_technique,
-             match_technique, track_chosen_card, card_timeline_for,
-             where_did_card_go, verify_palm_hypothesis]
+    # ===== Deep Agent를 LangGraph StateGraph로 구성 =====
+    # 단일 ReAct 루프 대신 SCAN→HYPOTHESIZE→VERIFY→REVISE→CONCLUDE 5개 노드로
+    # 흐름을 강제. 각 노드는 자기 단계에 필요한 도구만 갖는 sub-agent로 동작.
 
-    agent = create_react_agent(
-        ChatOpenAI(model=model, max_tokens=AGENT_MAX_TOKENS),
-        tools,
-        prompt=AGENT_SYSTEM,
+    mode_ko = MODE_KO.get(mode, mode)
+
+    SCAN_PROMPT = (
+        f"당신은 {mode_ko} 영상의 **SCAN 단계** 분석가입니다. "
+        "list_suspect_moments + track_chosen_card 두 도구를 호출해 "
+        "(1) 의심 시점 목록과 (2) 관객이 고른 카드 후보·관련 단서를 한 번에 "
+        "파악하세요. 결과를 한국어로 간결히 정리(불릿)해 다음 단계에 넘기세요. "
+        "추측·가설은 아직 세우지 마세요 — 사실 수집만."
     )
-    task = (f"이 {MODE_KO.get(mode, mode)} 영상의 비밀 기법을 분석하세요. "
-            f"SCAN→HYPOTHESIZE→VERIFY→REVISE→CONCLUDE 흐름을 따르세요. "
-            f"먼저 list_suspect_moments + track_chosen_card로 전체 그림을 파악한 뒤, "
-            f"의심 시점마다 inspect_moment/match_technique로 가설을 세우고, "
-            f"verify_palm_hypothesis/where_did_card_go로 그 가설을 다른 시점 데이터로 "
-            f"검증하세요. 가설이 반박되면 수정한 뒤 최종 결론을 작성하세요.")
-    # reflect 루프가 도구를 더 많이 호출하므로 recursion_limit을 넉넉히.
-    result = agent.invoke({"messages": [("user", task)]},
-                          config={"recursion_limit": 8 * max_inspect + 24})
+    HYPOTHESIZE_PROMPT = (
+        f"당신은 {mode_ko} 영상의 **HYPOTHESIZE 단계** 분석가입니다. "
+        "각 의심 시점에 대해 inspect_moment(time_sec)로 비전 관찰을 하고 "
+        "match_technique(time_sec)로 라이브러리 매칭 점수를 확인한 뒤, "
+        f"가설(어떤 기법인지)을 한 줄씩 세우세요. inspect_moment는 최대 "
+        f"{max_inspect}회. 가설은 '시점 — 후보 기법 — 핵심 근거 한 줄' 형식."
+        " 검증은 다음 VERIFY 단계에서 하니까 이 단계에선 가설만."
+        f" 카드 영상에선 coin 전용 기법(프렌치 드롭 등)을 후보에서 제외하세요."
+    )
+    VERIFY_PROMPT = (
+        f"당신은 {mode_ko} 영상의 **VERIFY 단계** 분석가입니다. "
+        "이전 단계의 가설들을 카드 타임라인 데이터로 검증합니다. "
+        "각 가설에 대해 verify_palm_hypothesis(time, card_id?)로 그 시점에 "
+        "chosen card가 사라졌는지·얼마나 후 다시 등장하는지 확인하고, "
+        "where_did_card_go / card_timeline_for로 보강 단서를 모으세요. "
+        "검증 결과: '가설 → 지지(strong/weak) 또는 반박' 형식으로 한 줄씩."
+    )
+    REVISE_PROMPT = (
+        f"당신은 {mode_ko} 영상의 **REVISE 단계** 분석가입니다. "
+        "VERIFY에서 반박된 가설을 수정하거나 철회하고, 지지된 가설은 강화하세요. "
+        "도구 호출 없이 reasoning만. 최종 정제된 가설 목록을 한 줄씩 출력하세요. "
+        "철회된 가설은 별도로 '철회: X (이유)' 로 명시."
+    )
+    CONCLUDE_PROMPT = (
+        f"당신은 {mode_ko} 영상의 **CONCLUDE 단계** 분석가입니다. "
+        "정제된 가설을 바탕으로 최종 결론을 작성합니다. 각 채택 기법에 대해 "
+        "explain_technique(기법명)을 호출해 작동 원리/관찰 단서/참고 영상을 "
+        "확보하세요. 최종 결론은 한국어로 자세히: (1) 이 트릭이 무엇을 "
+        "보여주는지, (2) 사용된 각 기법의 작동 원리, (3) 어느 시점·어떤 카드 "
+        "이벤트가 근거인지. REVISE에서 철회된 가설도 짧게 언급."
+    )
 
-    summary = ""
-    for m in reversed(result["messages"]):
-        if getattr(m, "type", "") == "ai" and m.content:
-            summary = m.content if isinstance(m.content, str) else str(m.content)
-            break
+    # 노드별 sub-agent 생성. 각자 자기 도구 subset만 알고 자기 ReAct 루프를 돈다.
+    def _llm():
+        return ChatOpenAI(model=model, max_tokens=AGENT_MAX_TOKENS)
+
+    scan_agent = create_react_agent(
+        _llm(), [list_suspect_moments, track_chosen_card], prompt=SCAN_PROMPT)
+    hyp_agent = create_react_agent(
+        _llm(), [inspect_moment, match_technique], prompt=HYPOTHESIZE_PROMPT)
+    ver_agent = create_react_agent(
+        _llm(), [verify_palm_hypothesis, where_did_card_go, card_timeline_for],
+        prompt=VERIFY_PROMPT)
+    # REVISE는 도구 없는 순수 추론 — 빈 도구 리스트로 react_agent 만들면 단발 호출
+    rev_agent = create_react_agent(_llm(), [], prompt=REVISE_PROMPT)
+    conc_agent = create_react_agent(
+        _llm(), [explain_technique], prompt=CONCLUDE_PROMPT)
+
+    # ----- State 정의 -----
+    class DeepAgentState(TypedDict, total=False):
+        scan: str
+        hypotheses: str
+        verifications: str
+        revised: str
+        conclusion: str
+
+    def _last_ai_text(invoke_result) -> str:
+        for m in reversed(invoke_result["messages"]):
+            if getattr(m, "type", "") == "ai" and m.content:
+                c = m.content
+                return c if isinstance(c, str) else str(c)
+        return ""
+
+    # ----- 노드 함수 -----
+    @traceable(name="deep-scan", run_type="chain")
+    def scan_node(state: DeepAgentState) -> dict:
+        msg = (f"이 {mode_ko} 영상의 의심 시점과 chosen card를 파악하세요. "
+               "두 도구를 모두 호출한 뒤 결과를 정리해 보고하세요.")
+        r = scan_agent.invoke({"messages": [("user", msg)]},
+                              config={"recursion_limit": 16})
+        return {"scan": _last_ai_text(r)}
+
+    @traceable(name="deep-hypothesize", run_type="chain")
+    def hypothesize_node(state: DeepAgentState) -> dict:
+        msg = (f"[SCAN 단계 결과]\n{state.get('scan', '(없음)')}\n\n"
+               "위 정보를 바탕으로 각 의심 시점을 inspect/match해 가설을 세우세요. "
+               f"inspect_moment는 {max_inspect}회 한도.")
+        r = hyp_agent.invoke({"messages": [("user", msg)]},
+                             config={"recursion_limit": 4 * max_inspect + 12})
+        return {"hypotheses": _last_ai_text(r)}
+
+    @traceable(name="deep-verify", run_type="chain")
+    def verify_node(state: DeepAgentState) -> dict:
+        msg = (f"[SCAN]\n{state.get('scan', '(없음)')}\n\n"
+               f"[HYPOTHESES]\n{state.get('hypotheses', '(없음)')}\n\n"
+               "각 가설을 verify_palm_hypothesis 등으로 검증하세요.")
+        r = ver_agent.invoke({"messages": [("user", msg)]},
+                             config={"recursion_limit": 24})
+        return {"verifications": _last_ai_text(r)}
+
+    @traceable(name="deep-revise", run_type="chain")
+    def revise_node(state: DeepAgentState) -> dict:
+        msg = (f"[HYPOTHESES]\n{state.get('hypotheses', '(없음)')}\n\n"
+               f"[VERIFICATIONS]\n{state.get('verifications', '(없음)')}\n\n"
+               "반박된 가설은 철회·수정하고, 지지된 가설은 강화한 최종 가설 목록을 정리하세요.")
+        r = rev_agent.invoke({"messages": [("user", msg)]},
+                             config={"recursion_limit": 4})
+        return {"revised": _last_ai_text(r)}
+
+    @traceable(name="deep-conclude", run_type="chain")
+    def conclude_node(state: DeepAgentState) -> dict:
+        msg = (f"[SCAN]\n{state.get('scan', '(없음)')}\n\n"
+               f"[REVISED HYPOTHESES]\n{state.get('revised', '(없음)')}\n\n"
+               "위 가설들에서 최종 채택된 기법마다 explain_technique을 호출한 뒤 "
+               "전체 트릭 추정을 자세히 한국어로 작성하세요.")
+        r = conc_agent.invoke({"messages": [("user", msg)]},
+                              config={"recursion_limit": 16})
+        return {"conclusion": _last_ai_text(r)}
+
+    # ----- 그래프 조립 -----
+    g = StateGraph(DeepAgentState)
+    g.add_node("SCAN", scan_node)
+    g.add_node("HYPOTHESIZE", hypothesize_node)
+    g.add_node("VERIFY", verify_node)
+    g.add_node("REVISE", revise_node)
+    g.add_node("CONCLUDE", conclude_node)
+    g.add_edge(START, "SCAN")
+    g.add_edge("SCAN", "HYPOTHESIZE")
+    g.add_edge("HYPOTHESIZE", "VERIFY")
+    g.add_edge("VERIFY", "REVISE")
+    g.add_edge("REVISE", "CONCLUDE")
+    g.add_edge("CONCLUDE", END)
+
+    deep_graph = g.compile()
+    final_state = deep_graph.invoke({})
+    summary = final_state.get("conclusion", "") or final_state.get("revised", "")
 
     analyses = sorted(scratch.inspections, key=lambda a: -_score_for(segments, a["peak_sec"]))
     for a in analyses:
         a["score"] = round(_score_for(segments, a["peak_sec"]), 3)
-    return {"analyses": analyses, "summary": summary,
-            "techniques": scratch.techniques_found, "matches": scratch.matches}
+    return {
+        "analyses": analyses,
+        "summary": summary,
+        "techniques": scratch.techniques_found,
+        "matches": scratch.matches,
+        # 디버그/추적용 단계별 출력
+        "deep_stages": {
+            "scan": final_state.get("scan", ""),
+            "hypotheses": final_state.get("hypotheses", ""),
+            "verifications": final_state.get("verifications", ""),
+            "revised": final_state.get("revised", ""),
+        },
+    }
 
 
 def _score_for(segments: list[dict], time_sec: float) -> float:
