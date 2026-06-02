@@ -222,25 +222,32 @@ def main(argv: list[str] | None = None) -> int:
             card_tl = build_card_timeline(objects, meta.duration_sec)
             print(f"      [카드 타임라인] {len(card_tl.card_ids)}개 카드 ID")
             # 음성 cue 추출(전사 캐시 재사용). 실패해도 시각만으로 식별 진행.
+            audio_cues = None
             try:
                 from .audio_cues import transcribe_and_extract
-                mentions, phrases = transcribe_and_extract(str(video_path))
-                if mentions:
-                    print(f"      [음성 cue] 카드 언급 {len(mentions)}건, "
-                          f"선택 구문 {len(phrases) if phrases else 0}건")
+                audio_cues = transcribe_and_extract(str(video_path)) or {}
+                if audio_cues:
+                    n_m = len(audio_cues.get("mentions") or [])
+                    n_p = len(audio_cues.get("phrases") or [])
+                    n_n = len(audio_cues.get("numbers") or [])
+                    n_c = len(audio_cues.get("counts") or [])
+                    print(f"      [음성 cue] 카드 언급 {n_m}건, 선택 구문 {n_p}건, "
+                          f"숫자 언급 {n_n}건, 카운팅 시퀀스 {n_c}건")
             except Exception as e:
                 print(f"      [음성 cue 스킵] {e}")
-                mentions, phrases = None, None
+                audio_cues = {}
             from .chosen_card import identify_chosen_card
             chosen_evidence = identify_chosen_card(
-                card_tl, frames=frames, mentions=mentions,
-                selection_phrases=phrases,
+                card_tl, frames=frames,
+                mentions=audio_cues.get("mentions") if audio_cues else None,
+                selection_phrases=audio_cues.get("phrases") if audio_cues else None,
             )
             print(f"      [Chosen card] {chosen_evidence.card_id} "
                   f"(신뢰도 {chosen_evidence.confidence}) "
                   f"— {chosen_evidence.rationale}")
         _run_agent(llm_segs, video_path, meta.fps, args, out_dir,
-                   card_timeline=card_tl, chosen_evidence=chosen_evidence)
+                   card_timeline=card_tl, chosen_evidence=chosen_evidence,
+                   audio_cues=audio_cues if obj_ready else None)
 
     print(f"\n완료. 결과 폴더: {out_dir.resolve()}")
     return 0
@@ -252,7 +259,8 @@ def _fmt_ts(t: float) -> str:
 
 
 def _run_agent(llm_segs, video_path, fps, args, out_dir: Path,
-               card_timeline=None, chosen_evidence=None) -> None:
+               card_timeline=None, chosen_evidence=None,
+               audio_cues=None) -> None:
     """도구 호출 에이전트(ReAct, OpenAI 비전 도구 + LangSmith 추적)로 분석."""
     print(f"[4/4] 도구 호출 에이전트 분석 중... ({args.llm_model}, "
           f"의심 {len(llm_segs)}개 — 에이전트가 직접 inspect)")
@@ -264,7 +272,7 @@ def _run_agent(llm_segs, video_path, fps, args, out_dir: Path,
         result = analyze(str(video_path), fps, seg_metas,
                          mode=args.mode, model=args.llm_model,
                          max_inspect=args.llm_top, card_timeline=card_timeline,
-                         chosen_evidence=chosen_evidence)
+                         chosen_evidence=chosen_evidence, audio_cues=audio_cues)
     except Exception as e:
         print(f"      [오류] 에이전트 실행 실패: {e}", file=sys.stderr)
         print("      OPENAI_API_KEY를 설정했는지 확인하세요.", file=sys.stderr)

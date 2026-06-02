@@ -185,7 +185,7 @@ def _snap_to_peak(segments: list[dict], time_sec: float, tol: float = 0.6) -> fl
 def analyze(video_path: str, fps: float, segments: list[dict],
            mode: str = "card", model: str = "gpt-4o",
            max_inspect: int = 6, card_timeline=None,
-           chosen_evidence=None) -> dict:
+           chosen_evidence=None, audio_cues=None) -> dict:
     """비디오 경로 + 탐지된 의심 순간 메타로 ReAct 에이전트를 돌려 분석.
 
     segments: [{peak_sec, score, top_signals}, ...]
@@ -525,6 +525,9 @@ def analyze(video_path: str, fps: float, segments: list[dict],
         "1) **list_candidate_tricks()** (effect=None) — 전체 카탈로그 한 번 확인 (필수).\n"
         "2) NARRATIVE 효과 후보들로 list_candidate_tricks(effect)도 호출.\n"
         "3) **관측 beat 흐름이 시사하는 트릭 4~6개 선정**:\n"
+        "   - **NARRATIVE의 audio_ctx에 1~52 숫자 + 카운팅 시퀀스 → "
+        "card_at_any_number(ACAAN) / any_card_at_any_number_classic / "
+        "card_at_dealt_number / predicted_position 후보 반드시 포함**.\n"
         "   - 같은 카드 여러 번 reveal → **ambitious_card** 반드시 포함\n"
         "   - 사인 카드 강조 → ambitious / card_to_pocket_signed / 등\n"
         "   - 색 다른 카드 → red_hot_mama / chicago_opener / color_changing_deck\n"
@@ -649,6 +652,20 @@ def analyze(video_path: str, fps: float, segments: list[dict],
                              f"(\"{chosen_evidence.audio_mention.text[:80]}\")")
             elif chosen_evidence.card_id:
                 audio_ctx = f"\n추정 chosen card(다중 신호): {chosen_evidence.card_id}"
+        # 숫자/카운팅 단서 — ACAAN 등 숫자 기반 트릭의 결정적 단서
+        if audio_cues:
+            nums = audio_cues.get("numbers") or []
+            counts = audio_cues.get("counts") or []
+            if nums:
+                sample = [(round(n.time_sec, 1), n.number) for n in nums[:8]]
+                uniq_nums = sorted({n.number for n in nums})
+                audio_ctx += (f"\n음성 숫자 언급 {len(nums)}건 — 등장 숫자: "
+                              f"{uniq_nums} (시점/숫자 일부: {sample})")
+            if counts:
+                seq_descs = [f"@{c.start_sec:.1f}s [{','.join(str(n) for n in c.numbers)}]"
+                             for c in counts[:3]]
+                audio_ctx += (f"\n음성 카운팅 시퀀스 {len(counts)}건: "
+                              f"{'; '.join(seq_descs)}")
 
         content: list[dict] = [{"type": "text", "text": (
             f"이 {mode_ko} 영상의 균등 샘플 {len(frames_at)}프레임 (시각순). "
@@ -671,10 +688,16 @@ def analyze(video_path: str, fps: float, segments: list[dict],
             "  · **penetration** — 카드가 물체 관통\n"
             "  · **attraction** — 카드가 천장·이마 등에 부착\n\n"
             "**중요 패턴 단서**:\n"
+            "  - **음성에 1~52 숫자 + 카운팅 시퀀스(1,2,3,...) → ACAAN(prediction) "
+            "    강력 후보**. 관객이 임의 숫자 호명 → 그 위치 카운트 후 카드 매칭.\n"
             "  - 같은 카드가 영상 중 여러 번 reveal → **ambitious** 강력 후보\n"
             "  - '색 다른 카드' → transformation OR coincidence(미리 깔림) 양쪽\n"
             "  - 사인 카드 강조 + 반복 등장 → ambitious / signed card routine\n"
             "  - 여러 카드 동시 매칭 → coincidence / sympathy\n"
+            "  - **'reveal'을 분류할 때 주의**: 카드를 한 장씩 떨어뜨리며 카운트하는 "
+            "    동작이면 'count_deal'(ACAAN 단서), 같은 카드가 다시 맨 위에서 나타나면 "
+            "    'repeated_reveal'(ambitious 단서). 둘은 시각만으론 비슷해 보이니 "
+            "    음성 숫자 단서를 결정적 기준으로 사용.\n"
             "  - 시각만으로 구별 어려운 경우 여러 후보 모두 명시.\n\n"
             "**Narrative beats**: 영상 흐름의 핵심 사건들 (시각순). 형식 "
             "'@<시각>: <사건>'. 가능한 beat 카테고리:\n"
